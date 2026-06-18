@@ -1,0 +1,16 @@
+{
+  "_config": "plugin",
+  "_host": "oc",
+  "_doc": "Plugin-only: the AGT governance plugin ON with the shipped DEFAULT policy (enforce mode), native permission left permissive so the plugin is the sole governance layer. policy_path points at the repo's config/default-policy.json (the exact regex set the bypass cases target). NOTE: because OpenCode never fires the permission.ask plugin hook (opencode#7006) and bash sits at reviewTools, the plugin hard-denies every bash not separately allow-listed (deny_kind=fail-closed-review) — this is the shipped behaviour under test, not a config choice.",
+  "plugin_enabled": true,
+  "policy_path": "../../config/default-policy.json",
+  "policy_profile": "default",
+  "opencode": {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "bash": "allow",
+      "edit": "allow",
+      "webfetch": "allow"
+    }
+  }
+}

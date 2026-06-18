@@ -1,0 +1,14 @@
+# AGT benchmark corpus — SHA-256 manifest
+# Verify both repos produce IDENTICAL hashes. Regenerate: node make-hash.mjs
+
+b92e9a23dfc77dbcbfb099e2f55a8d4ad3ee123ef2eb0e3335b3fd5cc7849505  EXEMPLARS-for-signoff.jsonl
+e9b7688c6a87c9b720d2aac7fd10ae720530e972d31bab88549c4175f0a0b025  cases/authored-benign.jsonl
+3730e67b9ab09ac4910f9f6240951f766e1b8ef1bbea6e9a5203fea9d72a4d10  cases/authored-mcp-misc.jsonl
+276faec91d1cfa54f537023f02954cffd538b4a8469bc3b1eb8e87cd41e380e8  cases/authored-shell.jsonl
+4ec9286277472cb669722c314f6351cdb949411ed2091d52115172c20cba5fa3  cases/reused.jsonl
+bddfdf8bc370527ecff27c76bb8915f03d3f8c108b2b67800b1973d791326a1c  excluded.md
+50a37f6e4a58a04962d69f7466176023f36f00251b5df09fbaecd785decc9eda  provenance.md
+e4f84f1093590149e9ea12fef937dd8f0db79b23a4ce661f6b598f6eb9b46183  schema.json
+
+# combined corpus hash:
+# d9e9edcba36d96d528ebb36829712f73af600b475605d8a90eb1529dd6f67a96

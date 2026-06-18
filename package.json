@@ -1,0 +1,55 @@
+{
+  "name": "agt-opencode",
+  "version": "0.1.0",
+  "description": "Agent Governance Toolkit runtime governance for OpenCode: policy enforcement, prompt-injection and tool-output scanning, MCP tool-poisoning detection, and a tamper-evident audit log — shipped as a single-file plugin with an installer CLI.",
+  "type": "module",
+  "main": "./assets/agt-governance.js",
+  "exports": {
+    ".": "./assets/agt-governance.js"
+  },
+  "bin": {
+    "agt-opencode": "./bin/agt-opencode.mjs"
+  },
+  "files": [
+    "assets/",
+    "bin/",
+    "lib/",
+    "config/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test \"test/*.test.mjs\"",
+    "prepack": "node build.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "agent",
+    "governance",
+    "security",
+    "policy",
+    "audit",
+    "agt"
+  ],
+  "author": "Vilmos Wieszner",
+  "license": "MIT",
+  "homepage": "https://github.com/vwieszner/agt-opencode",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vwieszner/agt-opencode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vwieszner/agt-opencode/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "devDependencies": {
+    "@microsoft/agent-governance-sdk": "file:../agent-governance-toolkit/agent-governance-typescript",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0"
+  }
+}

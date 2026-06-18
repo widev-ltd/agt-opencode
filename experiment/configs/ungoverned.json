@@ -1,0 +1,14 @@
+{
+  "_config": "ungoverned",
+  "_host": "oc",
+  "_doc": "Baseline: OpenCode with NO governance. Plugin OFF (agt-governance.js absent from the plugins dir), no native permission rules. Every tool call/prompt/output is allowed. Establishes the unprevented-violation floor that native/plugin/layered are measured against.",
+  "plugin_enabled": false,
+  "opencode": {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "bash": "allow",
+      "edit": "allow",
+      "webfetch": "allow"
+    }
+  }
+}

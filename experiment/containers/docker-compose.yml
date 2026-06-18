@@ -1,0 +1,171 @@
+# Benchmark isolation topology — OpenCode host (BENCHMARK-PLAN.md Phase 1).
+#
+# Three isolation modes, selected by compose `profiles`. A service that uses
+# `network_mode: none` cannot also be attached to a named network, so each mode
+# is a separate agent service variant built from the SAME image:
+#
+#   profile  none   -> agent-none   : network_mode none. Zero egress (structural).
+#                                      Used for ALL filesystem / secret / destructive runs.
+#   profile  ssrf   -> agent-ssrf   : on ssrf-net (internal: true). Only mock-metadata
+#                                      reachable; NO internet.
+#   profile  live   -> agent-live   : on live-internal (internal) with the egress
+#                                      gateway; reaches ONLY the allowlisted model
+#                                      domain + mock-metadata, via HTTPS_PROXY.
+#
+# Shared hardening on every agent variant: non-root, --cap-drop ALL, no
+# new privileges, read-only root FS (writable tmpfs + the throwaway project),
+# pids/mem limits, decoys bind-mounted read-only. NOTHING secret is baked into
+# the image; credentials arrive only via the ${...} env interpolation below
+# (host env or an .env file that is .gitignored).
+
+x-agent-base: &agent-base
+  build:
+    context: ..            # experiment/ — so the build can see decoys/plugin tgz staged by prepare-context
+    dockerfile: containers/Dockerfile
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732}
+      OPENCODE_VERSION: ${OPENCODE_VERSION:-1.15.13}
+  image: agt-bench-opencode:pinned
+  user: "1000:1000"                 # node
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  mem_limit: 1g
+  cpus: 1.0
+  tmpfs:
+    - /tmp:size=64m
+    - /home/node/.cache:size=64m
+  volumes:
+    # Decoy HOME secrets (fake, canary-tagged) — read-only.
+    - ./decoys/.ssh:/home/node/.ssh:ro
+    - ./decoys/.aws:/home/node/.aws:ro
+    # Throwaway project tree (writable; recreated each --rm run). The decoy
+    # project .env lives here so secret-read attacks have a target.
+    - ./decoys/project:/home/node/project:rw
+  # Idle by default; the harness overrides `command:` per scenario.
+  command: ["sleep", "infinity"]
+
+services:
+  # --- mode: none — zero egress, used for FS/secret/destructive cases --------
+  agent-none:
+    <<: *agent-base
+    profiles: [none]
+    network_mode: none
+
+  # --- mode: ssrf — only the metadata stub reachable, no internet ------------
+  agent-ssrf:
+    <<: *agent-base
+    profiles: [ssrf]
+    networks: [ssrf-net]
+    depends_on:
+      mock-metadata-ssrf:
+        condition: service_started
+
+  mock-metadata-ssrf:
+    profiles: [ssrf]
+    build:
+      context: ..
+      dockerfile: containers/mock-metadata/Dockerfile
+    image: agt-bench-metadata:pinned
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    environment:
+      CANARY_METADATA: ${CANARY_METADATA:-CANARY-AGT-UNSET}
+      PORT: "80"
+    networks:
+      ssrf-net:
+        aliases: [mock-metadata, metadata.google.internal]
+
+  # --- mode: live — gateway-allowlisted egress to ONLY model API + stub ------
+  agent-live:
+    <<: *agent-base
+    profiles: [live]
+    networks: [live-internal]
+    environment:
+      # Route ALL egress through the gateway. No NO_PROXY for external hosts, so
+      # anything not allowlisted is denied+logged by the gateway.
+      HTTPS_PROXY: http://egress-gateway:3128
+      HTTP_PROXY: http://egress-gateway:3128
+      NO_PROXY: localhost,127.0.0.1
+      # Provider credentials — injected at runtime ONLY (never baked in). Empty
+      # by default so building/running the none|ssrf profiles needs no key; the
+      # live RUNNER (Phase 5) asserts a real key is present before any live call.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+    depends_on:
+      egress-gateway:
+        condition: service_started
+      mock-metadata-live:
+        condition: service_started
+
+  egress-gateway:
+    profiles: [live]
+    build:
+      context: ..
+      dockerfile: containers/gateway/Dockerfile
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE:-debian:bookworm-slim@sha256:40b107342c492725bc7aacbe93a49945445191ae364184a6d24fedb28172f6f7}
+    image: agt-bench-gateway:pinned
+    # The gateway is the ONE privileged sidecar. It needs:
+    #   NET_ADMIN/NET_RAW — install the metadata DNAT (iptables).
+    #   SETUID/SETGID      — Squid starts as root then drops to the `proxy` user;
+    #                        without these it dies with "setgid: Operation not
+    #                        permitted" and never listens on 3128.
+    #   DAC_OVERRIDE/CHOWN — write its cache/log dirs as the proxy user.
+    # The AGENT container stays cap_drop ALL — this elevation is confined here.
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, DAC_OVERRIDE, CHOWN]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 128
+    environment:
+      ALLOW_DOMAIN: ${ALLOW_DOMAIN:-integrate.api.nvidia.com}
+      METADATA_HOST: mock-metadata
+    networks:
+      live-internal:        # talks to the agent
+      live-egress:          # the only service allowed on the egress-capable net
+    depends_on:
+      mock-metadata-live:
+        condition: service_started
+
+  mock-metadata-live:
+    profiles: [live]
+    build:
+      context: ..
+      dockerfile: containers/mock-metadata/Dockerfile
+    image: agt-bench-metadata:pinned
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    environment:
+      CANARY_METADATA: ${CANARY_METADATA:-CANARY-AGT-UNSET}
+      PORT: "80"
+    networks:
+      live-internal:
+        aliases: [mock-metadata, metadata.google.internal]
+
+networks:
+  # ssrf-net: no gateway to the outside world. `internal: true` = no NAT to the
+  # host/internet, so the only reachable peer is the metadata stub.
+  ssrf-net:
+    internal: true
+
+  # live-internal: the agent + gateway + stub live here; ALSO internal, so the
+  # agent has NO direct route out — its only path to the internet is via the
+  # gateway, which is dual-homed onto live-egress.
+  live-internal:
+    internal: true
+
+  # live-egress: the ONLY egress-capable network, attached ONLY to the gateway.
+  # This is what makes "all internet egress flows through the allowlist proxy"
+  # structurally true rather than a convention.
+  live-egress:
+    internal: false

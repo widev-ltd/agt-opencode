@@ -1,0 +1,51 @@
+agt-opencode — AGT runtime governance for OpenCode
+==================================================
+
+This project is an independent, personal integration. It is not affiliated
+with, endorsed by, or supported by Microsoft, SST, or the OpenCode project.
+
+It packages and adapts components of Microsoft's Agent Governance Toolkit
+(AGT) so they run as an OpenCode plugin.
+
+Upstream project
+----------------
+  Microsoft Agent Governance Toolkit
+  https://github.com/microsoft/agent-governance-toolkit
+  License: MIT (Copyright (c) Microsoft Corporation)
+  Vendored from commit: 4b6bda4deec4d235b05b538486314b2eba26c1ff
+
+Components copied verbatim from AGT (MIT headers retained)
+---------------------------------------------------------
+  plugin/src/poisoning.mjs   <- AGT text/poisoning helpers
+
+Components adapted from AGT (MIT headers retained)
+-------------------------------------------------
+  plugin/src/policy.mjs  <- AGT governance engine
+    Adapted for OpenCode's in-process, single-shell-tool model:
+    - retargeted to OpenCode tool names (lowercase read/bash/etc.);
+    - recordAudit() rewritten to persist a cross-session SHA-256 hash chain,
+      and getPolicyStatus()/formatPolicySummary() rewritten to read and verify
+      that on-disk chain (the upstream in-memory AuditLogger neither loads prior
+      entries nor exposes a load API, so it cannot chain across sessions);
+    - the audit chain is keyless and tamper-evident, not tamper-proof
+      (see README "Known limitations").
+  plugin/src/sdk-loader.mjs  <- AGT SDK loader, reworked as a bundle-friendly
+    shim so esbuild can inline the SDK into a single artifact.
+
+  config/default-policy.json and config/profiles/*.json are derived from the
+  AGT Copilot CLI policy profiles, retargeted to OpenCode tool names, with the
+  shell command rules expanded to cover PowerShell, find/xargs, and encoded
+  bypasses (so dangerous commands routed through OpenCode's single `bash` tool
+  are caught regardless of shell). The shipped default is the `balanced` tier.
+
+Vendored / bundled SDK
+----------------------
+  build.mjs bundles @microsoft/agent-governance-sdk (AGT TypeScript SDK, MIT),
+  the adapter, and the AGT engine into the single artifact
+  assets/agt-governance.js. The AGT SDK is "Public Preview".
+
+Original work
+-------------
+  plugin/src/agt-plugin.ts (the OpenCode adapter), build.mjs, and the installer
+  CLI under bin/ + lib/ are original to this project, licensed under the MIT
+  License (see LICENSE).

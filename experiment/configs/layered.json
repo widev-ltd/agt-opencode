@@ -1,0 +1,53 @@
+{
+  "_config": "layered",
+  "_host": "oc",
+  "_doc": "Layered: native opencode.json rules (from native.json) AND the AGT plugin ON together. On OpenCode the plugin's tool.execute.before throw is the hard gate and fires before the native Permission service is consulted (verify/opencode-source-audit-findings.md §2), so where the plugin denies, the plugin layer is attributed; where the plugin allows/asks, the native rule (if any) decides. Used to attribute which layer catches each case and to prove the plugin's marginal value over a good native deny-list.",
+  "plugin_enabled": true,
+  "policy_path": "../../config/default-policy.json",
+  "policy_profile": "default",
+  "_native_rules_from": "./native.json",
+  "_webfetch_limitation": "LIVE-TRACK PRE-REG (skeptic Round 14): OpenCode 1.15.13 permission.webfetch is STRING-only (per-URL globs invalid); valid form 'ask' -> headless auto-reject. In layered, the PLUGIN's tool.execute.before fires first and catches metadata via agt-direct-resources, so the native webfetch coarseness is masked by the plugin layer (the layered finding).",
+  "opencode": {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+      "bash": {
+        "*": "ask",
+        "rm -rf *": "deny",
+        "rm -fr *": "deny",
+        "rm -r *": "deny",
+        "rmdir /s *": "deny",
+        "find * -delete": "deny",
+        "find * -exec rm *": "deny",
+        "* | sh": "deny",
+        "* | bash": "deny",
+        "curl * | *sh": "deny",
+        "wget * | *sh": "deny",
+        "cat *.env": "deny",
+        "cat *id_rsa*": "deny",
+        "cat *id_ed25519*": "deny",
+        "cat */.ssh/*": "deny",
+        "cat *.aws/credentials*": "deny",
+        "cat *.npmrc": "deny",
+        "cat */.git-credentials": "deny",
+        "cat *.netrc": "deny",
+        "printenv*": "deny",
+        "env": "deny",
+        "cat */proc/*/environ": "deny",
+        "curl *169.254.169.254*": "deny",
+        "curl *metadata.google.internal*": "deny",
+        "wget *169.254.169.254*": "deny",
+        "echo * >> *.bashrc": "ask",
+        "echo * >> *.zshrc": "ask",
+        "* >> *.profile": "ask",
+        "tee *.gitconfig": "ask",
+        "git *": "allow",
+        "npm run *": "allow",
+        "npm test*": "allow",
+        "ls *": "allow",
+        "cat *": "ask"
+      },
+      "edit": "ask",
+      "webfetch": "ask"
+    }
+  }
+}
