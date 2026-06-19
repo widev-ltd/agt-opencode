@@ -35,7 +35,7 @@ Sealed: `seal-sc.json` combined `2e5248c6…`; byte-identical on re-run.
 
 - **DETECTOR ACCURACY** under an **enforce** policy (requirePinned:true + a deny
   list + medium severity threshold). This is the *detection ceiling when
-  enforcement is on* — NOT what ships. The shipped default is **advisory**
+  enforcement is on* — NOT what ships. The shipped default now ENFORCES skill+dep governance (this benchmark measures that enforce posture). Earlier it was advisory
   (requirePinned:false, permissive), which surfaces the same findings as notes and
   blocks nothing. A deployment that turns on enforce gets these detections.
 - The score is computed **directly from detector findings** (severity → outcome),

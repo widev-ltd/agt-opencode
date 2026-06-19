@@ -277,10 +277,26 @@
     "mode": "advisory",
     "_note": "Session-level tool-call budgets. Advisory mode warns when a budget is exceeded without blocking. Set mode to 'enforce' to require approval (ask) when a budget is exceeded. Budgets reset when the agent process restarts.",
     "budgets": [
-      { "tool": "bash",      "limit": 150, "windowSeconds": 3600 },
-      { "tool": "webfetch",  "limit": 50,  "windowSeconds": 3600 },
-      { "tool": "websearch", "limit": 50,  "windowSeconds": 3600 },
-      { "tool": "*",         "limit": 500, "windowSeconds": 3600 }
+      {
+        "tool": "bash",
+        "limit": 150,
+        "windowSeconds": 3600
+      },
+      {
+        "tool": "webfetch",
+        "limit": 50,
+        "windowSeconds": 3600
+      },
+      {
+        "tool": "websearch",
+        "limit": 50,
+        "windowSeconds": 3600
+      },
+      {
+        "tool": "*",
+        "limit": 500,
+        "windowSeconds": 3600
+      }
     ]
   },
   "exfilPolicies": {
@@ -293,7 +309,11 @@
     "enabled": true,
     "mode": "advisory",
     "_note": "Content safety scanner for tool output and fetched web content. Catches harmful instruction categories (violence, weapon synthesis), jailbreak attempts, and credential social-engineering embedded in tool output. Advisory mode warns; enforce mode suppresses the output. Wire externalApi to call Azure AI Content Safety or another moderation API.",
-    "builtinCategories": ["harmful-instructions", "jailbreak", "credential-social-engineering"],
+    "builtinCategories": [
+      "harmful-instructions",
+      "jailbreak",
+      "credential-social-engineering"
+    ],
     "customPatterns": []
   },
   "dlpPolicies": {
@@ -376,8 +396,8 @@
   ],
   "dependencyPolicies": {
     "enabled": true,
-    "mode": "advisory",
-    "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). Advisory mode surfaces typosquats, unpinned/non-registry deps, untrusted indexes, and npm install-scripts as context. Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
+    "mode": "enforce",
+    "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). ENFORCE by default: denies at/above severityThreshold; set mode to advisory to only surface findings as notes. Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
     "severityThreshold": "high",
     "requirePinned": false,
     "allow": [],
@@ -387,8 +407,8 @@
   },
   "skillPolicies": {
     "enabled": true,
-    "mode": "advisory",
-    "_note": "Skill (Agent Skill) governance: integrity attestation + dangerous-pattern, secret (DLP reuse), prompt-injection, capability-profile, and source-allowlist scans. Advisory mode surfaces findings and notes when a skill is not yet attested. Set mode to 'enforce' to stop-and-approve an unattested skill once (a `user-approved` cert is then written so the unchanged skill runs silently) and to deny on at/above-threshold findings. Pre-scan skills with `skills audit` to avoid the first prompt.",
+    "mode": "enforce",
+    "_note": "Skill (Agent Skill) governance: integrity attestation + dangerous-pattern, secret (DLP reuse), prompt-injection, capability-profile, and source-allowlist scans. ENFORCE by default: stop-and-approve an unattested skill once and deny on at/above-threshold findings; set mode to advisory to only warn. Set mode to 'enforce' to stop-and-approve an unattested skill once (a `user-approved` cert is then written so the unchanged skill runs silently) and to deny on at/above-threshold findings. Pre-scan skills with `skills audit` to avoid the first prompt.",
     "blockSecrets": true,
     "blockInjection": true,
     "allowedSources": [],
@@ -397,6 +417,7 @@
       "maxFsWrite": true,
       "maxSubprocess": true,
       "maxSecretRead": true
-    }
+    },
+    "severityThreshold": "high"
   }
 }
