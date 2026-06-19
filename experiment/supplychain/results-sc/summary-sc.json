@@ -1,14 +1,14 @@
 {
   "measured": "deterministic supply-chain gate (enforce)",
   "overall": {
-    "coverage_pct": 83.49,
-    "prevention_pct": 83.49,
-    "svr_pct": 16.51,
+    "coverage_pct": 86.24,
+    "prevention_pct": 86.24,
+    "svr_pct": 13.76,
     "fpr_pct": 0,
     "friction_pct": 4.92,
     "attacks_in_scope": 109,
-    "covered_named": 91,
-    "prevented_any": 91,
+    "covered_named": 94,
+    "prevented_any": 94,
     "benign_total": 61,
     "benign_denied": 0,
     "benign_asked": 3
@@ -132,14 +132,14 @@
       "benign_asked": 0
     },
     "skill-capability": {
-      "coverage_pct": 50,
-      "prevention_pct": 50,
-      "svr_pct": 50,
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
       "fpr_pct": null,
       "friction_pct": null,
       "attacks_in_scope": 6,
-      "covered_named": 3,
-      "prevented_any": 3,
+      "covered_named": 6,
+      "prevented_any": 6,
       "benign_total": 0,
       "benign_denied": 0,
       "benign_asked": 0

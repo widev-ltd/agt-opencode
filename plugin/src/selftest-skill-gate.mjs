@@ -163,6 +163,27 @@ try {
   ok("F2: stale scanned cert is NOT laundered to user-approved by approval",
     lAfter && lAfter.basis === "scanned" && (lAfter.rawFindings ?? []).length === 1);
 
+  // CONFIG: skillPolicies.maxAgeMs is honored by the runtime gate (it is passed
+  // through compileSkillPolicy → isFresh). A clean full-coverage cert ~1h old is
+  // fresh under the 7-day default but STALE under a 1-minute custom window.
+  const age = mkSkill("agecfg");
+  const ageKey = skillIntegrityKey(skillFileHashesSync(age.dir));
+  writeAttestation(ageKey, {
+    basis: "scanned", manifestHash: "x", rawFindings: [], scanCoverage: "full",
+    scannerName: "trivy", vulnDbVersion: "DB-1",
+    timestampMs: Date.now() - 3600 * 1000, // ~1 hour old
+    policySnapshot: { mode: "enforce" },
+  });
+  const ageDefault = checkSkillDeps(enfState, { command: age.cmd, cwd: base });
+  ok("config: 1h-old clean cert under default 7-day window → fresh → silent allow",
+    (ageDefault === null) || (ageDefault.deny === null && ageDefault.raiseToReview === false));
+  const enfShortAge = { policy: compilePolicy({
+    skillPolicies: { enabled: true, mode: "enforce", maxAgeMs: 60 * 1000 },
+  }) };
+  const ageShort = checkSkillDeps(enfShortAge, { command: age.cmd, cwd: base });
+  ok("config: same cert under maxAgeMs=60s → stale → review (knob wired through)",
+    ageShort && ageShort.raiseToReview === true && ageShort.notes.some((n) => /stale/i.test(n)));
+
   // ── Robustness: never throws on a bad cwd / command ──
   let threw = false;
   try {

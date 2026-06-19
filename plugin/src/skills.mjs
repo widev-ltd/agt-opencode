@@ -311,6 +311,13 @@ export const CAPABILITY_SIGNATURES = {
     { source: "\\b(?:requests\\.(?:get|post|put|delete|head|patch)|urllib\\.request|urlopen|http\\.client|httpx\\.|aiohttp\\.)", flags: "" },
     { source: "\\bfetch\\s*\\(|\\b(?:https?|net|dgram|tls)\\.(?:request|get|connect|createConnection)\\b|\\bnew\\s+WebSocket\\b|\\baxios\\b", flags: "" },
     { source: "\\bNet::HTTP\\b|\\bopen-uri\\b|\\bsocket\\.(?:socket|create_connection)\\b", flags: "" },
+    // Other popular JS HTTP clients (A-CAP-EVADE Finding 3): got / undici /
+    // node-fetch / superagent / ky / needle / phin. Matched via their import or
+    // require — the reliable signal — plus undici's and got's call APIs. (Bare
+    // `got(` is intentionally NOT matched: "got" is a common English word and
+    // would false-positive in prose; require/import is the unambiguous form.)
+    { source: "\\b(?:require|from|import)\\b[^\\n]{0,80}['\"](?:got|undici|node-fetch|superagent|ky|needle|phin)['\"]", flags: "" },
+    { source: "\\bundici\\.(?:request|fetch|stream|pipeline|connect|upgrade)\\b|\\bgot\\.(?:get|post|put|delete|patch|head|stream)\\b", flags: "" },
     // Aliased / dynamic imports (item 8, best-effort): `import socket`,
     // `import requests as r` (then r.get), `from urllib import request`, and a
     // dynamic import of a known network module. Catches the common alias forms.
@@ -338,6 +345,10 @@ export const CAPABILITY_SIGNATURES = {
   ],
   secretFileRead: [
     { source: "(?:/|~|\\$HOME)[^\\n]{0,80}/\\.(?:aws/credentials|ssh/id_[a-z0-9]{1,12}|netrc|npmrc|pypirc|docker/config\\.json|kube/config|gitconfig)\\b", flags: "i" },
+    // Cloud SDK credential stores (A-CAP-EVADE Finding 3): gcloud's
+    // application-default / legacy credentials and Azure's token cache. These are
+    // standing credential files no benign skill needs to read directly.
+    { source: "(?:/|~|\\$HOME)[^\\n]{0,80}/\\.(?:config/gcloud/(?:application_default_credentials\\.json|legacy_credentials|credentials\\.db)|azure/(?:accessTokens\\.json|azureProfile\\.json|msal_token_cache\\.json))\\b", flags: "i" },
     { source: "\\.env\\b(?![.\\w])", flags: "i" },
     { source: "\\b(?:cat|less|more|head|tail|type)\\b[^\\n]{0,60}(?:credentials?|secret|token|\\.pem|private[_-]?key|id_rsa)\\b", flags: "i" },
     // NOTE (item 9 FP fix): an environment READ (os.environ / process.env,
@@ -348,6 +359,53 @@ export const CAPABILITY_SIGNATURES = {
 };
 
 export const CAPABILITY_DIMENSIONS = Object.keys(CAPABILITY_SIGNATURES);
+
+// ── Declared-capability least-privilege model ────────────────────────────────
+// A skill DECLARES the capabilities it is allowed to use via `allowed-capabilities`
+// in its SKILL.md YAML frontmatter. The scanner then enforces least privilege:
+// any capability the scripts ACTUALLY use that the skill did NOT declare is flagged
+// (HIGH) — a skill cannot silently do network/subprocess/secret-read without saying
+// so. Crucially, self-declaration is a TRANSPARENCY control, not an escape hatch:
+// declaring a capability suppresses the undeclared-excess finding, but the
+// declaration is a visible, reviewable line in the manifest AND the operator's
+// capabilityProfile budget remains the HARD CEILING above it — a declared
+// capability the operator budget forbids is still flagged (over-budget). So an
+// attacker can avoid a finding only by openly DECLARING the capability (a signal a
+// reviewer sees), never by hiding it.
+//
+// Each capability DIMENSION maps to the operator-budget key that caps it (the keys
+// are not a mechanical "max"+Cap(dim) — fsWriteOutsideCwd→maxFsWrite,
+// secretFileRead→maxSecretRead — so the mapping is explicit).
+const CAPABILITY_BUDGET_KEY = {
+  network: "maxNetwork",
+  fsWriteOutsideCwd: "maxFsWrite",
+  subprocess: "maxSubprocess",
+  secretFileRead: "maxSecretRead",
+};
+
+// Friendly aliases an author might write in `allowed-capabilities`, mapped onto the
+// canonical dimension names. The canonical names themselves are also accepted.
+// Unknown names are ignored (never throw). Kept deliberately small + robust.
+const CAPABILITY_DECLARATION_ALIASES = {
+  network: "network",
+  net: "network",
+  "network-egress": "network",
+  http: "network",
+  subprocess: "subprocess",
+  exec: "subprocess",
+  shell: "subprocess",
+  process: "subprocess",
+  secretfileread: "secretFileRead",
+  secret: "secretFileRead",
+  secrets: "secretFileRead",
+  "secret-read": "secretFileRead",
+  "secret-file-read": "secretFileRead",
+  fswriteoutsidecwd: "fsWriteOutsideCwd",
+  "fs-write": "fsWriteOutsideCwd",
+  fswrite: "fsWriteOutsideCwd",
+  write: "fsWriteOutsideCwd",
+  "file-write": "fsWriteOutsideCwd",
+};
 
 // ── Policy compilation (mirrors compileDlpPolicy) ────────────────────────────
 
@@ -366,6 +424,10 @@ export const CAPABILITY_DIMENSIONS = Object.keys(CAPABILITY_SIGNATURES);
  *     capabilityProfile: {                   (per-dimension budget; true = allowed)
  *       maxNetwork, maxFsWrite, maxSubprocess, maxSecretRead
  *     },
+ *     maxAgeMs: number,                      (attestation freshness window; gate
+ *                                             default DEFAULT_MAX_AGE_MS = 7 days)
+ *     severityThreshold: severity,           (min finding severity that escalates
+ *                                             in the runtime gate; default "high")
  *     dlp: compiled DLP policy (reused scanner),
  *   }
  */
@@ -403,8 +465,18 @@ export function compileSkillPolicy(raw) {
     maxSecretRead: cp.maxSecretRead !== false,  // false → flag any secret-file read
   };
 
+  // Attestation freshness window + escalation threshold for the RUNTIME gate
+  // (policy.mjs reads these as `skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS` and
+  // `skillPolicy.severityThreshold ?? "high"`). Pass through only when the
+  // operator set them, so an unset policy keeps the gate's built-in defaults.
+  const maxAgeMs = Number.isFinite(raw.maxAgeMs) ? Number(raw.maxAgeMs) : undefined;
+  const severityThreshold =
+    raw.severityThreshold != null ? normalizeSeverity(raw.severityThreshold) : undefined;
+
   return {
     mode,
+    maxAgeMs,
+    severityThreshold,
     allowedSources: Array.isArray(raw.allowedSources)
       ? raw.allowedSources.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
       : [],
@@ -470,9 +542,14 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
     subprocess: false,
     secretFileRead: false,
   };
+  // DECLARED capabilities parsed from SKILL.md frontmatter (least-privilege model).
+  // Default: NOTHING declared — so any used capability is undeclared until the
+  // manifest says otherwise. Captured during the walk, applied in the post-loop
+  // capability check. Returned for transparency.
+  let declaredCapabilities = new Set();
 
   if (!skillPolicy) {
-    return { findings, fileHashes, capabilities };
+    return { findings, fileHashes, capabilities, declaredCapabilities: [] };
   }
 
   let root;
@@ -483,6 +560,7 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
       findings: [{ kind: "scan-error", severity: "low", file: String(skillDir), detail: "Invalid skill directory path." }],
       fileHashes,
       capabilities,
+      declaredCapabilities: [],
     };
   }
 
@@ -514,6 +592,7 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
       findings: [...findings, { kind: "scan-error", severity: "low", file: root, detail: `Skill directory walk failed: ${error?.message ?? error}` }],
       fileHashes,
       capabilities,
+      declaredCapabilities: [],
     };
   }
 
@@ -599,6 +678,14 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
     // SECRETS: reuse dlp.mjs + skill-specific patterns over EVERY file.
     scanSecretsInto(findings, relPath, bodyText, skillPolicy);
 
+    // DECLARED CAPABILITIES: parse the SKILL.md manifest's `allowed-capabilities`
+    // frontmatter (least-privilege model). Captured here while the body is in hand;
+    // applied to the capability findings AFTER the walk. Only the canonical SKILL.md
+    // manifest declares capabilities (sibling prose cannot grant privilege).
+    if (baseName === "skill.md") {
+      declaredCapabilities = parseDeclaredCapabilities(bodyText);
+    }
+
     // INJECTION: model-facing prose (SKILL.md AND other bundled prose — item 5).
     if (skillPolicy.blockInjection && isProse) {
       for (const p of skillPolicy.injectionPatterns) {
@@ -639,13 +726,23 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
     }
   }
 
-  // CAPABILITY POLICY: flag any capability the budget disallows.
-  pushCapabilityFinding(findings, capabilities.network, skillPolicy.capabilityProfile.maxNetwork, "network", "network egress (fetch/requests/curl/socket)");
-  pushCapabilityFinding(findings, capabilities.fsWriteOutsideCwd, skillPolicy.capabilityProfile.maxFsWrite, "fs-write", "filesystem write outside the working directory");
-  pushCapabilityFinding(findings, capabilities.subprocess, skillPolicy.capabilityProfile.maxSubprocess, "subprocess", "subprocess / shell spawn");
-  pushCapabilityFinding(findings, capabilities.secretFileRead, skillPolicy.capabilityProfile.maxSecretRead, "secret-read", "read of a credential file or environment");
+  // CAPABILITY LEAST-PRIVILEGE: for every dimension the skill USES, flag it unless
+  // it is BOTH declared (in SKILL.md allowed-capabilities) AND within the operator
+  // budget. Declaration suppresses the undeclared-excess finding; the operator
+  // budget remains the hard ceiling (a declared-but-over-budget capability is still
+  // flagged). See parseDeclaredCapabilities / pushCapabilityFinding.
+  const capHuman = {
+    network: "network egress (fetch/requests/curl/socket)",
+    fsWriteOutsideCwd: "a filesystem write outside the working directory",
+    subprocess: "subprocess / shell spawn",
+    secretFileRead: "a read of a credential file",
+  };
+  for (const dim of CAPABILITY_DIMENSIONS) {
+    const budgetAllows = skillPolicy.capabilityProfile[CAPABILITY_BUDGET_KEY[dim]];
+    pushCapabilityFinding(findings, dim, capabilities[dim], declaredCapabilities, budgetAllows, capHuman[dim] ?? dim);
+  }
 
-  return { findings, fileHashes, capabilities };
+  return { findings, fileHashes, capabilities, declaredCapabilities: [...declaredCapabilities] };
 }
 
 // SECRETS layer: the reused DLP scanner PLUS skill-specific provider tokens
@@ -690,13 +787,104 @@ function isModelFacingProse(baseName, ext) {
   return baseName === "reference" || baseName.startsWith("reference.");
 }
 
-function pushCapabilityFinding(findings, detected, allowed, label, human) {
-  if (detected && allowed === false) {
+// Parse the skill's DECLARED capabilities from its SKILL.md YAML frontmatter
+// (key `allowed-capabilities`). Returns a Set of canonical dimension names.
+// Tolerant + never-throws by contract:
+//   - absent frontmatter / absent key            → empty set (declares NOTHING)
+//   - a YAML flow list      [network, subprocess] → {network, subprocess}
+//   - a YAML block list     - network\n  - net    → {network}
+//   - a comma/space string  "network, exec"       → {network, subprocess}
+//   - friendly aliases (net→network, exec/shell→subprocess, …) are mapped
+//   - unknown names are ignored (no throw, no finding)
+function parseDeclaredCapabilities(skillMdText) {
+  const set = new Set();
+  try {
+    const text = String(skillMdText ?? "");
+    if (!text) return set;
+
+    // Extract the leading YAML frontmatter block: a line of `---`, then content,
+    // then a closing `---` (or `...`). Bounded so a pathological file is cheap.
+    const fmMatch = text.match(/^﻿?---[ \t]*\r?\n([\s\S]{0,8192}?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/);
+    if (!fmMatch) return set;
+    const fm = fmMatch[1];
+
+    // Find the `allowed-capabilities:` key (case-insensitive) and capture its value
+    // plus any following indented block-list lines. Bounded quantifiers (ReDoS-safe).
+    const keyMatch = fm.match(/^[ \t]*allowed[-_]?capabilities[ \t]*:[ \t]*([^\r\n]{0,400})((?:\r?\n[ \t]+[-][^\r\n]{0,200}){0,64})/im);
+    if (!keyMatch) return set;
+
+    const raw = [];
+    // Inline value after the colon: a flow list [a, b] or a scalar string.
+    let inline = String(keyMatch[1] ?? "").trim();
+    // Strip a trailing YAML comment FIRST (a `#` preceded by whitespace) so a
+    // valid list with a trailing comment — `[network]  # public API` — does not
+    // (a) lose its real declarations because the bracket-strip's endsWith("]")
+    // test fails, or (b) leak comment words in as bogus declarations once split
+    // on whitespace. (A-CAP-EVADE Finding 1.)
+    inline = inline.replace(/\s+#.*$/, "").trim();
+    // Strip the flow-list brackets robustly: leading `[` and everything from the
+    // last `]` onward (tolerates any residue after the close bracket).
+    if (inline.startsWith("[")) {
+      const end = inline.lastIndexOf("]");
+      inline = end >= 0 ? inline.slice(1, end) : inline.slice(1);
+    }
+    for (const tok of inline.split(/[,\s]+/)) {
+      if (tok) raw.push(tok);
+    }
+    // Block-list lines: "  - network".
+    const block = String(keyMatch[2] ?? "");
+    for (const line of block.split(/\r?\n/)) {
+      const m = line.match(/^[ \t]*-[ \t]*([^\r\n]{0,200})$/);
+      if (m && m[1]) raw.push(m[1].trim());
+    }
+
+    for (const token of raw) {
+      // Strip wrapping quotes and trailing YAML comments / commas.
+      const cleaned = token
+        .replace(/^['"]|['"]$/g, "")
+        .replace(/#.*$/, "")
+        .replace(/[,\]]+$/, "")
+        .trim()
+        .toLowerCase();
+      if (!cleaned) continue;
+      const canonical = CAPABILITY_DECLARATION_ALIASES[cleaned];
+      if (canonical) set.add(canonical); // unknown names silently ignored
+    }
+  } catch {
+    // Never throw — a malformed manifest declares nothing (fail safe: more findings,
+    // never fewer; an undeclared-but-used capability stays flagged).
+    return set;
+  }
+  return set;
+}
+
+// LEAST-PRIVILEGE capability finding. For a capability the skill ACTUALLY uses:
+//   - declared AND operator budget allows  → NO finding (benign declared use)
+//   - NOT declared                          → finding (undeclared capability)
+//   - declared BUT operator budget forbids  → finding (exceeds operator budget)
+// The operator budget (`max<Cap> === false`) is the HARD CEILING above the
+// declaration: declaring a capability can never override a budget that forbids it.
+// Self-declaration only suppresses the undeclared-excess finding — and is itself a
+// visible, reviewable signal in the manifest.
+function pushCapabilityFinding(findings, dim, detected, declared, budgetAllows, human) {
+  if (!detected) {
+    return;
+  }
+  if (!declared.has(dim)) {
     findings.push({
       kind: "capability",
       severity: "high",
       file: "(skill scripts)",
-      detail: `Skill uses ${human} but policy disallows the '${label}' capability.`,
+      detail: `Skill uses ${human} but did not declare it (undeclared capability: ${dim}). Add it to allowed-capabilities in SKILL.md to authorize it.`,
+    });
+    return;
+  }
+  if (budgetAllows === false) {
+    findings.push({
+      kind: "capability",
+      severity: "high",
+      file: "(skill scripts)",
+      detail: `Skill declares and uses ${human}, but capability ${dim} exceeds operator budget (${CAPABILITY_BUDGET_KEY[dim]} disallows it).`,
     });
   }
 }

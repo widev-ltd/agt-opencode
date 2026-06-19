@@ -423,6 +423,184 @@ ok("robustness: builtin pattern sets are non-empty",
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  Declared-capability least privilege (declared ∩ operator-budget)
+//  A skill DECLARES allowed-capabilities in SKILL.md frontmatter. Any capability
+//  USED beyond what it declared (or beyond the operator budget) is flagged; a
+//  benign skill that declares + uses a capability is clean. Self-declaration is a
+//  transparency control — visible in the manifest — and the operator budget stays
+//  the hard ceiling above it.
+// ════════════════════════════════════════════════════════════════════════════
+{
+  const mkSkill = (name, frontmatter, scriptName, scriptBody) => {
+    const d = join(base, "skills", name);
+    mkdirSync(join(d, "scripts"), { recursive: true });
+    writeFileSync(join(d, "SKILL.md"), frontmatter);
+    if (scriptName) writeFileSync(join(d, "scripts", scriptName), scriptBody);
+    return d;
+  };
+  const capFindings = (fs) => fs.filter((f) => f.kind === "capability");
+  const NET_SCRIPT = "import requests\nrequests.get('https://api.example/notify')\n";
+  const SUB_SCRIPT = "import subprocess\nsubprocess.run(['echo', 'hi'])\n";
+
+  // (1) declares [network] + uses network (default permissive budget) → NO finding.
+  {
+    const d = mkSkill("lp-declared-net",
+      "---\nname: notify\nallowed-capabilities: [network]\n---\n# Notify\nPosts a notification.",
+      "n.py", NET_SCRIPT);
+    const r = await scanSkill(d, policy);
+    ok("lp: declares [network] + uses network → NO capability finding",
+      r.capabilities.network === true && capFindings(r.findings).length === 0);
+    ok("lp: declaredCapabilities returned for transparency (contains network)",
+      Array.isArray(r.declaredCapabilities) && r.declaredCapabilities.includes("network"));
+  }
+
+  // (2) uses network, declares NOTHING → undeclared capability finding (network).
+  {
+    const d = mkSkill("lp-undeclared-net",
+      "---\nname: sneaky\n---\n# Sneaky\nClaims to be local but calls out.",
+      "n.py", NET_SCRIPT);
+    const r = await scanSkill(d, policy);
+    ok("lp: uses network, declares NOTHING → capability finding",
+      capFindings(r.findings).length >= 1);
+    ok("lp: the undeclared finding names network and says 'undeclared'",
+      hasDetail(r.findings, "capability", "network") &&
+      hasDetail(r.findings, "capability", "undeclared"));
+    ok("lp: declaredCapabilities is empty when nothing declared",
+      r.declaredCapabilities.length === 0);
+  }
+
+  // (3) declares [network] but USES subprocess → finding for subprocess, NOT network.
+  {
+    const d = mkSkill("lp-declared-net-uses-sub",
+      "---\nname: mixed\nallowed-capabilities: [network]\n---\n# Mixed\nDeclares network, runs a subprocess.",
+      "s.py", "import requests\nimport subprocess\nrequests.get('https://x')\nsubprocess.run(['id'])\n");
+    const r = await scanSkill(d, policy);
+    ok("lp: declared network is suppressed (no network capability finding)",
+      !hasDetail(r.findings, "capability", "network"));
+    ok("lp: undeclared subprocess IS flagged",
+      hasDetail(r.findings, "capability", "subprocess") &&
+      hasDetail(r.findings, "capability", "undeclared"));
+    ok("lp: exactly one capability finding (subprocess only)",
+      capFindings(r.findings).length === 1);
+  }
+
+  // (4) declares [network] + operator budget maxNetwork:false → over-budget finding
+  //     even though declared (operator ceiling beats the declaration).
+  {
+    const d = mkSkill("lp-declared-net-over-budget",
+      "---\nname: notify\nallowed-capabilities: [network]\n---\n# Notify\nPosts a notification.",
+      "n.py", NET_SCRIPT);
+    const tight = compileSkillPolicy({ enabled: true, mode: "enforce", capabilityProfile: { maxNetwork: false } });
+    const r = await scanSkill(d, tight);
+    ok("lp: declared network + maxNetwork:false → capability finding (over budget)",
+      hasDetail(r.findings, "capability", "network"));
+    ok("lp: the over-budget finding mentions exceeding the operator budget",
+      hasDetail(r.findings, "capability", "exceeds operator budget"));
+  }
+
+  // (5) benign skill that DECLARES everything it uses → zero capability findings.
+  {
+    const d = mkSkill("lp-declares-all",
+      "---\nname: worker\nallowed-capabilities: [network, subprocess, fs-write, secrets]\n---\n# Worker\nDoes a lot, declares all of it.",
+      "w.py",
+      "import requests\nimport subprocess\nrequests.get('https://x')\nsubprocess.run(['id'])\nopen('/etc/out','w').write('x')\nopen('/home/u/.aws/credentials').read()\n");
+    const r = await scanSkill(d, policy);
+    ok("lp: a skill that declares everything it uses → zero capability findings",
+      capFindings(r.findings).length === 0);
+    ok("lp: aliases (fs-write→fsWriteOutsideCwd, secrets→secretFileRead) parsed",
+      r.declaredCapabilities.includes("fsWriteOutsideCwd") &&
+      r.declaredCapabilities.includes("secretFileRead"));
+  }
+
+  // (6a) absent frontmatter → no declaration, never throws; an undeclared use flags.
+  {
+    const d = mkSkill("lp-no-frontmatter",
+      "# Plain\nNo YAML frontmatter at all.",
+      "n.py", NET_SCRIPT);
+    const r = await scanSkill(d, policy);
+    ok("lp: absent frontmatter → no throw, declares nothing, undeclared use flagged",
+      Array.isArray(r.declaredCapabilities) && r.declaredCapabilities.length === 0 &&
+      hasDetail(r.findings, "capability", "undeclared"));
+  }
+
+  // (6b) malformed `allowed-capabilities` → never throws; treated as no declaration.
+  {
+    const d = mkSkill("lp-malformed",
+      "---\nname: broken\nallowed-capabilities: [network, , ,, \nsubprocess\n---\n# Broken\nMalformed list.",
+      "n.py", NET_SCRIPT);
+    let threw = false;
+    let r;
+    try { r = await scanSkill(d, policy); } catch { threw = true; }
+    ok("lp: malformed allowed-capabilities never throws", threw === false && !!r);
+    ok("lp: malformed declaration still returns an array (no crash)",
+      Array.isArray(r.declaredCapabilities));
+  }
+
+  // (6c) block-list YAML form + comma-string form both parse.
+  {
+    const dBlock = mkSkill("lp-block-list",
+      "---\nname: b\nallowed-capabilities:\n  - network\n  - exec\n---\n# B\nBlock list form.",
+      "n.py", "import requests\nimport subprocess\nrequests.get('https://x')\nsubprocess.run(['id'])\n");
+    const rBlock = await scanSkill(dBlock, policy);
+    ok("lp: YAML block-list + alias (exec→subprocess) → both declared, zero findings",
+      rBlock.declaredCapabilities.includes("network") &&
+      rBlock.declaredCapabilities.includes("subprocess") &&
+      capFindings(rBlock.findings).length === 0);
+
+    const dStr = mkSkill("lp-comma-string",
+      "---\nname: s\nallowed-capabilities: network, exec\n---\n# S\nComma string form.",
+      "n.py", "import requests\nimport subprocess\nrequests.get('https://x')\nsubprocess.run(['id'])\n");
+    const rStr = await scanSkill(dStr, policy);
+    ok("lp: comma-string declaration form parses both capabilities",
+      rStr.declaredCapabilities.includes("network") &&
+      rStr.declaredCapabilities.includes("subprocess") &&
+      capFindings(rStr.findings).length === 0);
+  }
+
+  // (6c-bis) REGRESSION (A-CAP-EVADE Finding 1): a valid YAML flow list with a
+  //   trailing `# comment` must keep its real declarations AND must NOT leak
+  //   comment words in as bogus capabilities. The old endsWith("]") bracket-strip
+  //   failed on the comment → lost `network` (→ false-positive DENY of a benign
+  //   skill) and could pull a comment word ("secrets") in as a fake declaration.
+  {
+    const dC = mkSkill("lp-flow-comment",
+      "---\nname: c\nallowed-capabilities: [network]  # public weather API, no secrets read\n---\n# C\nFlow list + trailing comment.",
+      "n.py", NET_SCRIPT);
+    const rC = await scanSkill(dC, policy);
+    ok("lp: flow list + trailing comment → real declaration kept (network present)",
+      rC.declaredCapabilities.includes("network"));
+    ok("lp: flow list + trailing comment → declared network suppresses the finding",
+      capFindings(rC.findings).length === 0);
+    ok("lp: flow list + trailing comment → NO comment-word leakage (e.g. secrets)",
+      !rC.declaredCapabilities.includes("secretFileRead") &&
+      rC.declaredCapabilities.length === 1);
+
+    const dC2 = mkSkill("lp-flow-comment-multi",
+      "---\nname: c2\nallowed-capabilities: [network, exec]   # spawns a helper\n---\n# C2\nMulti-cap flow list + comment.",
+      "n.py", "import requests\nimport subprocess\nrequests.get('https://x')\nsubprocess.run(['id'])\n");
+    const rC2 = await scanSkill(dC2, policy);
+    ok("lp: multi-cap flow list + comment → both declared, zero findings, no leak",
+      rC2.declaredCapabilities.includes("network") &&
+      rC2.declaredCapabilities.includes("subprocess") &&
+      rC2.declaredCapabilities.length === 2 &&
+      capFindings(rC2.findings).length === 0);
+  }
+
+  // (6d) unknown declared names are ignored (not granted) — a used capability not
+  //      covered by any real declaration is still flagged.
+  {
+    const d = mkSkill("lp-unknown-name",
+      "---\nname: u\nallowed-capabilities: [telepathy, network]\n---\n# U\nUnknown + real name.",
+      "s.py", "import subprocess\nsubprocess.run(['id'])\n");
+    const r = await scanSkill(d, policy);
+    ok("lp: unknown declared names ignored; undeclared subprocess still flagged",
+      !r.declaredCapabilities.includes("telepathy") &&
+      r.declaredCapabilities.includes("network") &&
+      hasDetail(r.findings, "capability", "subprocess"));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  SECURITY: no false-clean stamp + bare-import name extraction (the invariant)
 // ════════════════════════════════════════════════════════════════════════════
 

@@ -49,7 +49,15 @@ A policy is a JSON document (`schemaVersion: 1`). The key fields:
   "blockedToolCalls": [ /* command-pattern rules: recursive-delete, dangerous-bootstrap, secret-read, persistence-write */ ],
   "directResourcePolicies": { "pathRules": [ /* credential paths */ ], "urlRules": [ /* metadata endpoints */ ] },
   "poisoningPatterns": [ /* prompt/output injection regexes */ ],
-  "additionalContext": [ /* extra guard lines injected into the session */ ]
+  "additionalContext": [ /* extra guard lines injected into the session */ ],
+
+  // ── Governance extensions (each has its own `mode`: "advisory" | "enforce") ──
+  "dlpPolicies":          { "mode": "advisory", /* credential/PII catalogues, allow-snippets */ },
+  "exfilPolicies":        { "mode": "enforce",  /* session-aware secret-reuse tripwire */ },
+  "rateLimitPolicies":    { "mode": "advisory", /* per-session, per-tool call budgets */ },
+  "contentSafetyPolicies":{ "mode": "advisory", /* harmful-instruction / jailbreak scan */ },
+  "dependencyPolicies":   { "mode": "enforce",  /* supply-chain dep hygiene — see below */ },
+  "skillPolicies":        { "mode": "enforce",  /* skill gating + attestation — see below */ }
 }
 ```
 
@@ -75,6 +83,76 @@ agt-opencode policy validate --file ./my-policy.json
 > **Note on `minimumPromptDefenseGrade`:** this value is reported by
 > `doctor`/status but is **not currently an enforcement gate** — it grades the
 > built-in guard prose, not your input. Treat it as informational.
+
+## Governance extensions
+
+Six extra layers run on top of the core policy. Each has its own `mode`
+(`advisory` warns, `enforce` blocks); set it per extension in the policy file. The
+content layers default to **advisory** (heuristic matching has FP/FN — validate on
+your workload before enforcing); the structural supply-chain and exfil layers
+default to **enforce**.
+
+| Extension | Key | Default | What it does |
+|---|---|---|---|
+| DLP | `dlpPolicies` | advisory | Credential values (AWS/GitHub/private-key) + PII (SSN, Luhn card, email) in tool output / webfetch URLs; `allowSnippets` suppress doc placeholders. |
+| Exfiltration | `exfilPolicies` | enforce | Session-aware: blocks an outbound request embedding a credential value seen earlier in tool output. |
+| Rate-limit | `rateLimitPolicies` | advisory | Per-session, per-tool call budgets. |
+| Content-safety | `contentSafetyPolicies` | advisory | Harmful-instruction / jailbreak / credential-social-engineering scan; optional external API. |
+| Dependency | `dependencyPolicies` | enforce | Supply-chain hygiene over a skill's / install command's deps. |
+| Skill | `skillPolicies` | enforce | Governs a skill before it runs: integrity attestation + scans. |
+
+### Dependency + skill supply-chain governance
+
+These two are the supply-chain gate (methodology + numbers in
+[`experiment/supplychain/BENCHMARK.md`](../experiment/supplychain/BENCHMARK.md)).
+They work in two tiers:
+
+- **Tier 1 (runtime, in-process, no network).** `dependencyPolicies` parses a
+  skill's manifests — Python `requirements.txt` / `pyproject.toml` / **PEP 723
+  inline metadata**, and Node `package.json` / lockfiles — and applies hygiene
+  rules: typosquat, unpinned, denied package, non-registry/editable install,
+  untrusted index, npm install-scripts, license. `skillPolicies` adds metadata
+  hygiene, dangerous-pattern / secret / injection / capability scans, a source
+  allowlist, and an **attestation lookup**.
+- **Tier 2 (`skills audit`, off the hot path).** Resolves the **full transitive
+  tree** (`uv` / `npm`) and runs an auto-detected CVE scanner (`trivy` /
+  `osv-scanner` / `pip-audit`), then writes a `scanned` attestation so a later
+  runtime gate is a cheap cache hit. See
+  [USAGE.md](USAGE.md#auditing-skills-ahead-of-use).
+
+Useful keys (both accept `mode` and merge over the shipped defaults):
+
+```jsonc
+"dependencyPolicies": {
+  "mode": "enforce",
+  "requirePinned": true,                 // unpinned spec → finding
+  "deny": ["evil-pkg"],                  // package names always denied
+  "deniedLicenses": ["agpl"],            // license deny list
+  "severityThreshold": "medium",         // min severity that escalates to deny
+  "allowedIndexes": ["https://pypi.org/simple"]  // [] = any index OK
+}
+"skillPolicies": {
+  "mode": "enforce",
+  "allowedSources": ["https://trusted-marketplace.example/"],  // skill origin allowlist ([] = any)
+  "capabilityProfile": {                 // operator budget — the HARD ceiling (false = forbid)
+    "maxNetwork": true, "maxSubprocess": true,
+    "maxFsWrite": false, "maxSecretRead": false
+  },
+  "severityThreshold": "high",           // min finding severity that escalates (default high)
+  "maxAgeMs": 604800000                  // attestation re-audit window (default 7 days)
+}
+```
+
+> **Capability least-privilege.** A skill declares what it may do in its
+> `SKILL.md` frontmatter (`allowed-capabilities: [network, subprocess, …]`). A
+> capability **used but not declared** — or declared but forbidden by the operator
+> `capabilityProfile` budget — is flagged. The budget is the hard ceiling: a
+> self-declaration can never override a capability the operator set to `false`.
+
+> **Fail-safe guarantee.** In `enforce`, a skill is silent-allowed only when its
+> deps were actually resolved transitively **and** scanned clean. If they can't be
+> (no resolver/scanner, resolver error, bare-import JS with no manifest) coverage
+> is `unavailable` → unverified = unsafe (review/deny), never a false-clean.
 
 ## Per-project override
 

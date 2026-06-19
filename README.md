@@ -77,6 +77,9 @@ agt-opencode uninstall [--remove-policy]   Remove the managed plugin
 agt-opencode doctor [--json]               Diagnose the install
 agt-opencode policy path|show              Inspect the active policy
 agt-opencode policy validate|apply --file <path> | --profile <name>
+agt-opencode skills audit <dir>...         Scan skill(s): resolve the full
+                                           transitive dep tree + CVE scan, then
+                                           write a supply-chain attestation
 ```
 
 Global options: `--opencode-home <dir>` overrides the OpenCode config home.

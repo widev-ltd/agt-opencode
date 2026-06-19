@@ -21,6 +21,13 @@ Every tool call, prompt, and tool result passes through the governance engine:
 - **Flagged tool output** (e.g. a web page containing "ignore previous
   instructions…") is suppressed or annotated as untrusted before the model sees
   it.
+- **A skill being invoked** is gated **before it runs**: its manifests (incl.
+  PEP 723 inline metadata) get metadata-hygiene + an attestation lookup, and — in
+  the default `enforce` posture — a skill is silent-allowed only if it carries a
+  fresh `scanned` attestation proving its full transitive dependency tree was
+  resolved and scanned clean. An unverified or vulnerable skill is sent to review
+  (or denied if a CVE/dangerous pattern was found). Run `skills audit` ahead of
+  time (below) so the first real use is a cheap cache hit instead of a review.
 
 ### The review→deny behaviour (important)
 
@@ -54,6 +61,7 @@ config home for any command.
 | `policy show` | Print the active policy (user policy, or the bundled default if none). |
 | `policy validate --file <path>` / `--profile <name>` | Validate a policy file or a bundled profile without applying it. |
 | `policy apply --file <path>` / `--profile <name>` | Write a policy file or bundled profile to the active policy path. |
+| `skills audit <dir> [<dir> …] [--scanner trivy\|osv-scanner\|pip-audit]` | Proactively scan one or more skill directories — resolve the full transitive dependency tree (`uv`/`npm`) and run a CVE scanner — then write a `scanned` attestation so the runtime gate is a cheap cache hit. |
 | `-h, --help` · `-v, --version` | Help / installer version. |
 
 ### Common tasks
@@ -85,6 +93,31 @@ agt-opencode policy apply    --file ./my-policy.json
 > **Restart OpenCode after `apply`/`install`/`update`.** The plugin reads its
 > policy at load time.
 
+### Auditing skills ahead of use
+
+The runtime gate (Tier 1) is fast and scanner-free; the deep transitive CVE scan
+(Tier 2) runs off the hot path via `skills audit`. Run it before a skill's first
+use so the runtime gate finds a fresh `scanned` attestation and allows silently
+instead of routing to review:
+
+```bash
+agt-opencode skills audit ~/.config/opencode/skills/my-skill
+agt-opencode skills audit ./skills/*                       # several at once
+agt-opencode skills audit ./skills/x --scanner osv-scanner # force a scanner
+```
+
+It resolves the **full transitive tree** (`uv` for Python incl. PEP 723 inline
+metadata; `npm` for Node) and runs an auto-detected scanner (`trivy` /
+`osv-scanner` / `pip-audit`) for CVEs, then writes an attestation keyed to the
+skill's file hashes. A later run with unchanged files is a cache hit (no rescan).
+
+> **Fail-safe:** the attestation records *honest coverage*. A skill is stamped
+> clean-eligible only when its deps were actually resolved transitively **and**
+> scanned clean. If `uv`/`npm` or a scanner is missing, the resolver errors, or a
+> bare-import JS skill has no manifest, coverage is `unavailable` → the skill is
+> treated as **unverified = unsafe** (review/deny), never a false-clean. Install
+> `uv`/`npm` + a scanner on `PATH` for the audit to produce a clean stamp.
+
 ## The audit log
 
 Every decision is appended to `~/.config/opencode/agt/audit-log.json` as a
@@ -113,4 +146,6 @@ AGT_OPENCODE_DEBUG=1 opencode run "list the files here"
 | Every tool call is denied with "failed to initialise" | The plugin failed to load (fail-closed). Run `agt-opencode doctor`; check Node ≥ 22 and that the bundle exists (`npm run build`). |
 | `doctor` says "plugin not installed" | Run `agt-opencode install`, then restart OpenCode. |
 | Policy changes have no effect | Restart OpenCode; confirm `policy path` points where you edited, and that no `.opencode/agt-policy.json` per-project override is shadowing it. |
+| A skill is sent to review on every use | No fresh `scanned` attestation — run `agt-opencode skills audit <dir>`. If it still won't stamp clean, `uv`/`npm` or a scanner is missing on `PATH` (coverage `unavailable` = fail-safe), or the deps genuinely carry a finding. |
+| `skills audit` reports coverage `unavailable` | The resolver (`uv`/`npm`) or scanner (`trivy`/`osv-scanner`/`pip-audit`) isn't on `PATH`, or a bare-import JS skill has no manifest. Install the tooling; this is fail-safe, not a false clean. |
 | `npm install` TLS failure | Corporate CA — see the TLS note in [INSTALL.md](INSTALL.md). |
