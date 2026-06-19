@@ -14,9 +14,11 @@ import {
   depsDecision,
   resolveTransitive,
   runVulnScanner,
+  resolveAndScan,
   osvSeverityBand,
   cvssScore,
 } from "./deps.mjs";
+import { execFileSync } from "node:child_process";
 
 let fail = 0;
 const ok = (name, cond) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) fail++; };
@@ -37,6 +39,31 @@ const writeCanon = (name, body) => {
 };
 const hasKind = (findings, kind) => findings.some((f) => f.kind === kind);
 const hasPkg = (findings, kind, pkg) => findings.some((f) => f.kind === kind && String(f.package).toLowerCase() === pkg.toLowerCase());
+
+// Detect whether a CLI tool is runnable so tool-dependent asserts can be guarded.
+// On Windows resolvers/scanners are .cmd shims or bare names; route through cmd.exe
+// (matching deps.mjs's spawnCapture) so the probe matches how the engine invokes it.
+const toolPresent = (cmd) => {
+  try {
+    if (process.platform === "win32") {
+      const comspec = process.env.ComSpec || process.env.COMSPEC || "cmd.exe";
+      execFileSync(comspec, ["/d", "/s", "/c", cmd, "--version"], { stdio: "ignore", timeout: 15000 });
+    } else {
+      execFileSync(cmd, ["--version"], { stdio: "ignore", timeout: 15000 });
+    }
+    return true;
+  } catch { return false; }
+};
+const HAVE_UV = toolPresent("uv");
+const HAVE_NPM = toolPresent("npm");
+const HAVE_SCANNER = toolPresent("trivy") || toolPresent("osv-scanner") || toolPresent("pip-audit");
+// A tool-gated assertion: assert `cond` ONLY when `present`; otherwise record a
+// skip line (counts as pass) so the suite is green both WITH and WITHOUT tools.
+const okIf = (present, name, cond) => {
+  if (present) { ok(name, cond); }
+  else { console.log(`SKIP  ${name} (tool not on PATH)`); }
+};
+console.log(`[tools] uv=${HAVE_UV} npm=${HAVE_NPM} scanner=${HAVE_SCANNER}\n`);
 
 const advisory = compileDepsPolicy({ enabled: true, mode: "advisory" });
 const pinned = compileDepsPolicy({ enabled: true, mode: "enforce", requirePinned: true });
@@ -434,35 +461,175 @@ try {
   ok("coverage: missing scanner → coverage:'unavailable' + dbVersion null",
     covMissing.coverage === "unavailable" && covMissing.dbVersion === null);
 
-  // ── TIER-2: transitive resolution (async, no scanner needed) ───────────────
-  const resLock = await resolveTransitive([], { cwd: dir });
-  ok("resolve: uses lockfile when present (fromLockfile)", resLock.fromLockfile === true && resLock.resolved.length > 0);
-  const emptyDir = mkdtempSync(join(tmpdir(), "agt-deps-empty-"));
-  try {
-    const resNoLock = await resolveTransitive([{ ecosystem: "pypi", name: "requests", spec: "requests==2.0", source: "t" }], { cwd: emptyDir });
-    ok("resolve: no lockfile → declared set + note", resNoLock.fromLockfile === false && typeof resNoLock.note === "string" && resNoLock.resolved.length === 1);
-  } finally {
-    rmSync(emptyDir, { recursive: true, force: true });
+  // ════════════════════════════════════════════════════════════════════════════
+  // TIER-2 SECURITY CONTRACT: ACTUAL transitive resolution + scan, and the
+  // FAIL-SAFE that the false-clean defect demands. Coverage vocabulary is
+  //   transitive | declared-only | unavailable
+  // and we must NEVER report `transitive` for a set that was not really resolved
+  // AND scanned. Tool-dependent asserts are gated behind a presence check (okIf);
+  // the FAIL-SAFE asserts always run, with NO tools needed.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // ── helper: write a manifest into a fresh dir and resolve+scan it ───────────
+  const inDir = (name, body) => {
+    const sub = join(dir, `t2-${subN++}`);
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, name), body);
+    return sub;
+  };
+  const sevSet = (findings) => new Set(findings.map((f) => f.severity));
+
+  // ── T2.1: PEP 723 inline vulnerable (jinja2==2.10) → transitive CVEs ────────
+  const pepDir = inDir("vuln.py", [
+    "# /// script",
+    '# dependencies = ["jinja2==2.10", "PyYAML==5.1"]',
+    "# ///",
+    "print('hi')",
+  ].join("\n"));
+  const pepScan = await resolveAndScan({ cwd: pepDir });
+  okIf(HAVE_UV && HAVE_SCANNER, "T2.1: PEP723 inline jinja2==2.10 → coverage 'transitive'",
+    pepScan.coverage === "transitive" && pepScan.method === "uv");
+  okIf(HAVE_UV && HAVE_SCANNER, "T2.1: PEP723 inline → CVE finding present (transitive scan caught it)",
+    pepScan.findings.length > 0 && sevSet(pepScan.findings).has("critical"));
+  // FAIL-SAFE (always): WITHOUT uv+scanner this must be 'unavailable', never a
+  // clean/transitive stamp. (The exact false-clean bug being fixed.)
+  if (!(HAVE_UV && HAVE_SCANNER)) {
+    ok("T2.1 FAIL-SAFE: PEP723 inline without uv/scanner → 'unavailable' (never clean)",
+      pepScan.coverage === "unavailable" && pepScan.findings.length === 0);
+  }
+  // INVARIANT (always): coverage 'transitive' is ONLY ever paired with real findings
+  // here, and is NEVER claimed when unavailable.
+  ok("T2.1 INVARIANT: never 'transitive' unless a scanner actually ran",
+    pepScan.coverage !== "transitive" || pepScan.available === true);
+
+  // ── T2.2: requirements.txt + pyproject.toml vulnerable → transitive CVEs ────
+  const reqDir = inDir("requirements.txt", "jinja2==2.10\nPyYAML==5.1\n");
+  const reqScan = await resolveAndScan({ cwd: reqDir });
+  okIf(HAVE_UV && HAVE_SCANNER, "T2.2: requirements.txt jinja2==2.10 → transitive CVEs",
+    reqScan.coverage === "transitive" && reqScan.findings.length > 0);
+  const pyprojDir = inDir("pyproject.toml", [
+    "[project]", 'name = "demo"', 'version = "0.0.0"',
+    'requires-python = ">=3.9"', 'dependencies = ["jinja2==2.10"]',
+  ].join("\n"));
+  const pyprojScan = await resolveAndScan({ cwd: pyprojDir });
+  okIf(HAVE_UV && HAVE_SCANNER, "T2.2: pyproject.toml jinja2==2.10 → transitive CVEs",
+    pyprojScan.coverage === "transitive" && pyprojScan.findings.length > 0);
+
+  // ── T2.3: package.json vulnerable (lodash@4.17.4) → transitive CVEs ─────────
+  const nodeDir = inDir("package.json", JSON.stringify({
+    name: "vuln-demo", version: "1.0.0", dependencies: { lodash: "4.17.4" },
+  }));
+  const nodeScan = await resolveAndScan({ cwd: nodeDir });
+  okIf(HAVE_NPM && HAVE_SCANNER, "T2.3: package.json lodash@4.17.4 → coverage 'transitive' via npm",
+    nodeScan.coverage === "transitive" && nodeScan.method === "npm" && nodeScan.findings.length > 0);
+  if (!(HAVE_NPM && HAVE_SCANNER)) {
+    ok("T2.3 FAIL-SAFE: package.json without npm/scanner → 'unavailable' (never clean)",
+      nodeScan.coverage === "unavailable" && nodeScan.findings.length === 0);
   }
 
-  // ── TIER-2: scanner auto-detect degrades gracefully ────────────────────────
-  // Force a scanner name that does not exist so probe fails regardless of host.
-  const scanForced = await runVulnScanner([], { cwd: dir, scannerCmd: "definitely-not-a-real-scanner-xyz" });
-  ok("scanner: forced-missing scanner → available:false, no throw, note present",
-    scanForced.available === false && Array.isArray(scanForced.findings) && typeof scanForced.note === "string");
-  // Auto-detect: do NOT require any scanner installed. Whatever the host has, the
-  // result must be a well-formed object with a boolean `available` and an array
-  // of findings — never an exception.
-  const scanAuto = await runVulnScanner([], { cwd: dir });
-  ok("scanner: auto-detect returns well-formed result (available bool + findings array)",
-    typeof scanAuto.available === "boolean" && Array.isArray(scanAuto.findings));
-  // Coverage/dbVersion are always present and consistent with availability.
-  ok("scanner: result always carries a coverage field (unavailable|declared-only|full)",
-    ["unavailable", "declared-only", "full"].includes(scanAuto.coverage));
-  ok("scanner: unavailable scan reports coverage 'unavailable'",
-    scanAuto.available || scanAuto.coverage === "unavailable");
-  ok("scanner: dbVersion is a string or null",
+  // ── T2.4: clean pinned-latest set → transitive, ZERO findings ──────────────
+  const cleanPyDir = inDir("requirements.txt", "six==1.17.0\n");
+  const cleanPyScan = await resolveAndScan({ cwd: cleanPyDir });
+  okIf(HAVE_UV && HAVE_SCANNER, "T2.4: clean six==1.17.0 → transitive, zero findings",
+    cleanPyScan.coverage === "transitive" && cleanPyScan.findings.length === 0);
+  const cleanNodeDir = inDir("package.json", JSON.stringify({
+    name: "clean", version: "1.0.0", dependencies: { ms: "2.1.3" },
+  }));
+  const cleanNodeScan = await resolveAndScan({ cwd: cleanNodeDir });
+  okIf(HAVE_NPM && HAVE_SCANNER, "T2.4: clean ms@2.1.3 → transitive, zero findings",
+    cleanNodeScan.coverage === "transitive" && cleanNodeScan.findings.length === 0);
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // FAIL-SAFE PANEL (ALWAYS asserted — no tools required). Every path that cannot
+  // reliably resolve+scan MUST yield coverage 'unavailable', MUST NOT throw, and
+  // MUST NOT claim a clean/transitive result. This is the security guarantee.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // FS1: no manifest at all → unavailable, never transitive.
+  const fsEmpty = mkdtempSync(join(tmpdir(), "agt-deps-empty-"));
+  try {
+    const r = await resolveAndScan({ cwd: fsEmpty });
+    ok("FS1: empty dir (no manifest) → coverage 'unavailable', no findings",
+      r.coverage === "unavailable" && r.findings.length === 0 && r.available === false);
+    const rt = await resolveTransitive([{ ecosystem: "pypi", name: "x", spec: "x==1", source: "t" }], { cwd: fsEmpty });
+    ok("FS1: resolveTransitive on empty dir → 'unavailable' (NEVER 'transitive')",
+      rt.coverage === "unavailable" && rt.scanDir === null);
+  } finally {
+    rmSync(fsEmpty, { recursive: true, force: true });
+  }
+
+  // FS2: a .py with NO PEP 723 block is not resolvable → unavailable.
+  const fsNoBlock = inDir("plain.py", "print('no deps here')\n");
+  {
+    const r = await resolveTransitive([], { cwd: fsNoBlock, manifests: [join(fsNoBlock, "plain.py")] });
+    ok("FS2: .py without a PEP723 block → 'unavailable' (no false transitive)",
+      r.coverage === "unavailable");
+  }
+
+  // FS3: NO scanner (forced-missing) even when resolution could succeed → the
+  // result is unavailable, NOT transitive. (Resolver-OK + scanner-missing.)
+  const fs3Dir = inDir("requirements.txt", "jinja2==2.10\n");
+  {
+    const r = await resolveAndScan({ cwd: fs3Dir, scannerCmd: "definitely-not-a-real-scanner-xyz" });
+    ok("FS3: resolver-ok but scanner forced-missing → 'unavailable', never 'transitive'",
+      r.coverage === "unavailable" && r.findings.length === 0 && r.available === false);
+  }
+
+  // FS4: runVulnScanner with a real resolved scanDir but a forced-missing scanner
+  // → unavailable; and with NO scanDir (legacy bare-cwd) → NEVER 'transitive'.
+  {
+    const noScanner = await runVulnScanner([], { scanDir: dir, coverage: "transitive", scannerCmd: "definitely-not-real-xyz" });
+    ok("FS4: forced-missing scanner over a scanDir → 'unavailable' (coverage ceiling discarded)",
+      noScanner.coverage === "unavailable" && noScanner.available === false);
+    const bareCwd = await runVulnScanner([], { cwd: dir });
+    ok("FS4: runVulnScanner with NO scanDir is NEVER 'transitive'",
+      bareCwd.coverage === "unavailable" || bareCwd.coverage === "declared-only");
+  }
+
+  // FS5: resolver ERROR (unresolvable package version) → unavailable, not transitive.
+  // Only meaningful when uv is present; otherwise FS1/FS3 already cover the no-tool path.
+  if (HAVE_UV) {
+    const fs5Dir = inDir("bad.py", [
+      "# /// script",
+      '# dependencies = ["this-package-does-not-exist-xyz123==9.9.9"]',
+      "# ///",
+    ].join("\n"));
+    const r = await resolveTransitive([{ ecosystem: "pypi", name: "x", spec: "x==1", source: "t" }], { cwd: fs5Dir });
+    ok("FS5: uv resolver ERROR (unresolvable pkg) → 'unavailable' (NEVER 'transitive')",
+      r.coverage === "unavailable" && r.scanDir === null && typeof r.note === "string");
+  } else {
+    console.log("SKIP  FS5: uv resolver-error path (uv not on PATH)");
+  }
+
+  // FS6: nothing ever throws across the whole Tier-2 surface, even on junk input.
+  let t2threw = false;
+  try {
+    await resolveTransitive(null, {});
+    await resolveTransitive(null, { cwd: null, manifests: null });
+    await runVulnScanner(null, {});
+    await runVulnScanner(null, { scanDir: null, coverage: "bogus", scannerCmd: null });
+    await resolveAndScan({});
+    await resolveAndScan({ cwd: null, manifests: null, specs: null });
+  } catch (e) {
+    t2threw = true; console.log("  Tier-2 threw:", e?.message);
+  }
+  ok("FS6: Tier-2 (resolveTransitive/runVulnScanner/resolveAndScan) never throws on junk", !t2threw);
+
+  // INVARIANT-WIDE: across every Tier-2 result observed above, a 'transitive'
+  // coverage is ALWAYS accompanied by available===true (a scanner actually ran).
+  const allT2 = [pepScan, reqScan, pyprojScan, nodeScan, cleanPyScan, cleanNodeScan];
+  ok("INVARIANT: every 'transitive' result had a scanner actually run (available)",
+    allT2.every((r) => r.coverage !== "transitive" || r.available === true));
+  ok("INVARIANT: no Tier-2 result reports the obsolete 'full' coverage value",
+    allT2.every((r) => r.coverage !== "full"));
+
+  // ── Well-formedness: coverage is always one of the three legal values ───────
+  const scanAuto = await resolveAndScan({ cwd: dir });
+  ok("well-formed: coverage ∈ {transitive, declared-only, unavailable}",
+    ["transitive", "declared-only", "unavailable"].includes(scanAuto.coverage));
+  ok("well-formed: dbVersion is a string or null",
     scanAuto.dbVersion === null || typeof scanAuto.dbVersion === "string");
+  ok("well-formed: findings is always an array", Array.isArray(scanAuto.findings));
 
 } finally {
   rmSync(dir, { recursive: true, force: true });

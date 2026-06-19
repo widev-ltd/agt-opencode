@@ -220,5 +220,52 @@ ok("decide: user-approved + no findings → allow (coverage check does not apply
 ok("decide: no basis + no findings → allow (unchanged for basis-less records)",
   decideFromFindings({ rawFindings: [] }, enforceHigh).effect === "allow");
 
+// ════════════════════════════════════════════════════════════════════════════
+//  FAIL-SAFE coverage gate — canonical vocabulary {transitive,declared-only,
+//  unavailable}. THE INVARIANT: an unverified/unscanned skill is NEVER silent-
+//  allowed. ONLY coverage 'transitive' + zero findings is a clean silent allow.
+// ════════════════════════════════════════════════════════════════════════════
+
+// transitive + 0 findings → allow (the ONLY clean silent-allow).
+ok("FAILSAFE: scanned + 'transitive' + 0 findings → allow (the only clean allow)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "transitive" }, enforceHigh).effect === "allow");
+// declared-only + 0 findings → review in ENFORCE (NOT allow): deps not fully scanned.
+ok("FAILSAFE: scanned + 'declared-only' + 0 findings → review in ENFORCE (NOT allow)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "declared-only" }, enforceHigh).effect === "review");
+// unavailable + 0 findings → review in ENFORCE (NOT allow): unverified = unsafe.
+ok("FAILSAFE: scanned + 'unavailable' + 0 findings → review in ENFORCE (NOT allow)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, enforceHigh).effect === "review");
+// The fail-safe NEVER yields 'allow' in enforce for a non-transitive scanned cert.
+ok("FAILSAFE: non-transitive scanned cert is NEVER allow in ENFORCE (declared-only)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "declared-only" }, enforceHigh).effect !== "allow");
+ok("FAILSAFE: non-transitive scanned cert is NEVER allow in ENFORCE (unavailable)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, enforceHigh).effect !== "allow");
+// An UNKNOWN/garbage coverage value on a scanned cert is treated as not-clean.
+ok("FAILSAFE: scanned + unknown coverage value + 0 findings → review in ENFORCE",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "totally-scanned-trust-me" }, enforceHigh).effect === "review");
+// Legacy synonym 'full' still maps to clean (back-compat with pre-rename certs).
+ok("FAILSAFE: legacy 'full' coverage still treated as transitive (clean allow)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "full" }, enforceHigh).effect === "allow");
+// A REAL transitive finding drives deny REGARDLESS of coverage (finding wins).
+ok("FAILSAFE: a real high finding denies even at 'transitive' coverage",
+  decideFromFindings({ basis: "scanned", rawFindings: [high], scanCoverage: "transitive" }, enforceHigh).effect === "deny");
+ok("FAILSAFE: a real high finding denies even at 'unavailable' coverage",
+  decideFromFindings({ basis: "scanned", rawFindings: [high], scanCoverage: "unavailable" }, enforceHigh).effect === "deny");
+// The review reason names the (canonical) coverage level for the operator.
+ok("FAILSAFE: review reason names coverage 'unavailable'",
+  /coverage: unavailable/.test(decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, enforceHigh).reason));
+// ADVISORY never blocks even for unverified coverage — it allows WITH a note.
+ok("FAILSAFE: advisory + 'unavailable' + 0 findings → allow with a coverage note",
+  (() => { const d = decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, advisoryHigh); return d.effect === "allow" && /coverage: unavailable/.test(d.reason); })());
+// recordSkillApproval analogue: a 'user-approved' cert (explicit human override)
+// with 0 findings is allowed EVEN when coverage was never established — but this is
+// an OVERRIDE distinct from a silent-allow of an unverified SCANNED cert above.
+ok("FAILSAFE: user-approved + 0 findings → allow (explicit override, coverage exempt)",
+  decideFromFindings({ basis: "user-approved", rawFindings: [] }, enforceHigh).effect === "allow");
+// …and the very same empty findings as a SCANNED cert is NOT a silent-allow — the
+// only difference is an explicit operator override, never a false-clean scan.
+ok("FAILSAFE: same empty cert as 'scanned'/unavailable is review (no silent-allow without override)",
+  decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, enforceHigh).effect === "review");
+
 console.log(`\n${fail === 0 ? "ALL PASS" : fail + " FAILED"}`);
 process.exit(fail === 0 ? 0 : 1);

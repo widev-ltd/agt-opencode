@@ -749,37 +749,99 @@ export async function auditSkillDir(skillDir, opts = {}) {
     summary.key = key;
 
     // 2 + 3. Dependency resolution + vuln scan (best-effort, lazy import).
+    //
+    // SECURITY INVARIANT: the cert's scanCoverage MUST reflect what was ACTUALLY
+    // resolved+scanned — it is NEVER hardcoded to 'transitive'/'full'. Only a real
+    // transitive resolve + scan (coverage 'transitive') with zero findings makes a
+    // clean cert; anything less ('declared-only'/'unavailable') leaves the cert
+    // NON-clean so the enforce gate treats the skill as unverified. The resolution
+    // is owned by deps.mjs (deps.resolveAndScan returns the honest coverage); we
+    // map that coverage onto the cert and NEVER reimplement resolution here.
     let vulnDbVersion;
     let scannerName;
+    summary.coverage = "unavailable"; // fail-safe default until a real scan proves otherwise
     try {
       const deps = await import("./deps.mjs");
-      // Parse every manifest reachable in the dir, resolve transitively, scan.
+      // Parse every manifest reachable in the dir for Tier-1 metadata findings.
       const declared = collectManifestSpecs(deps, skillDir, depsPolicy, summary);
-      const { resolved, fromLockfile, note } = await deps.resolveTransitive(declared, { cwd: skillDir });
+
+      // Prefer the sibling-owned resolveAndScan (honest coverage in one call). It
+      // ACTUALLY resolves transitively (uv/npm) then scans, returning
+      // { available, scanner, findings, coverage:'transitive'|'declared-only'|
+      //   'unavailable', dbVersion, method, note }. Its `coverage` is the security
+      // contract — already honest — so we map it through normalizeCoverage (which
+      // fails safe on any unknown value) and never upgrade it. If it is not present
+      // yet, fall back to resolveTransitive + runVulnScanner (back-compat path).
+      let resolved = [];
+      let coverage = "unavailable";
+      let findings = [];
+      let scanner = null;
+      let dbVersion;
+      let available = false;
+      let note;
+      let fromLockfile = false;
+
+      if (typeof deps.resolveAndScan === "function") {
+        // NOTE the real signature: a SINGLE options object ({cwd, specs, ...}); the
+        // declared spec set is passed as `specs`, NOT as a first positional arg.
+        const r = await deps.resolveAndScan({ cwd: skillDir, specs: declared, scannerCmd, timeoutMs });
+        // Trust the sibling's coverage verdict — it is the source of truth for
+        // whether a transitive scan actually happened. normalizeCoverage maps the
+        // canonical vocabulary through and fails ANY unknown value safe to a non-
+        // clean level, so a clean cert can only ever come from a real 'transitive'.
+        coverage = normalizeCoverage(r?.coverage);
+        findings = Array.isArray(r?.findings) ? r.findings : [];
+        scanner = r?.scanner ?? null;
+        dbVersion = r?.dbVersion;
+        available = r?.available === true;
+        note = r?.note;
+        // resolveAndScan owns coverage end-to-end (no separate lockfile signal to
+        // surface); leave fromLockfile false — coverage already encodes the truth.
+      } else {
+        // Back-compat path: resolve then scan separately. resolveTransitive only
+        // goes transitive when a lockfile exists; otherwise it is declared-only.
+        const rt = await deps.resolveTransitive(declared, { cwd: skillDir });
+        resolved = Array.isArray(rt?.resolved) ? rt.resolved : [];
+        fromLockfile = rt?.fromLockfile === true;
+        note = rt?.note;
+        const vuln = await deps.runVulnScanner(resolved, { cwd: skillDir, scannerCmd, timeoutMs, fromLockfile });
+        scanner = vuln?.scanner ?? null;
+        findings = Array.isArray(vuln?.findings) ? vuln.findings : [];
+        available = vuln?.available === true;
+        dbVersion = vuln?.dbVersion;
+        if (vuln?.note) note = vuln.note;
+        // Coverage HONESTY (this is the EXACT bug that shipped): the legacy
+        // runVulnScanner reports coverage 'full' whenever the chosen TOOL can scan
+        // a project tree (trivy/osv `scansLockfile:true`) — but that is a property
+        // of the TOOL, NOT proof that THIS skill's deps were transitively resolved.
+        // decideScanCoverage caps the claim: a 'transitive' bill is only honest when
+        // a lockfile ACTUALLY drove resolution. See its definition for the rule.
+        coverage = decideScanCoverage({ available, fromLockfile, claimedCoverage: vuln?.coverage });
+      }
+
       summary.resolved = resolved.map((s) => `${s.ecosystem}:${s.name}@${s.spec ?? ""}`);
       summary.fromLockfile = fromLockfile;
-      if (note) summary.note = note;
-
-      const vuln = await deps.runVulnScanner(resolved, { cwd: skillDir, scannerCmd, timeoutMs });
-      summary.scanner = vuln.scanner ?? null;
-      scannerName = vuln.scanner;
-      // Coverage HONESTY (A-SCANNER F1/F2): record what the vuln scan actually
-      // covered so a clean cert can't masquerade as fully-scanned when it wasn't.
-      //   full          → a real scanner ran over the resolved set
-      //   declared-only → ran, but only declared deps (no lockfile transitive)
-      //   unavailable   → no scanner installed / it failed → NOT a clean bill
-      summary.coverage = vuln.coverage ?? (vuln.available ? (fromLockfile ? "full" : "declared-only") : "unavailable");
-      if (vuln.available) {
-        for (const f of vuln.findings ?? []) {
-          summary.findings.push({ kind: "vulnerability", severity: f.severity, file: f.package, detail: `${f.id} in ${f.package}${f.fixedVersion ? ` (fixed in ${f.fixedVersion})` : ""}` });
-        }
-        vulnDbVersion = vuln.dbVersion ?? (await deps.scannerDbVersion(vuln.scanner))?.version;
-      } else if (vuln.note && !summary.note) {
-        summary.note = vuln.note;
+      summary.coverage = coverage;
+      summary.scanner = scanner;
+      scannerName = scanner;
+      if (note && !summary.note) summary.note = note;
+      // Vulnerability findings are recorded REGARDLESS of coverage so a real CVE
+      // always drives deny/review by severity downstream.
+      for (const f of findings) {
+        summary.findings.push({
+          kind: "vulnerability",
+          severity: f.severity,
+          file: f.package,
+          detail: `${f.id} in ${f.package}${f.fixedVersion ? ` (fixed in ${f.fixedVersion})` : ""}`,
+        });
+      }
+      if (available) {
+        vulnDbVersion = dbVersion ?? (await deps.scannerDbVersion(scanner))?.version;
       }
     } catch (depErr) {
-      // No deps module / scanner failure → skill scan still attests, but the vuln
-      // coverage is UNAVAILABLE (the runtime gate must not silent-allow on it).
+      // No deps module / resolver / scanner failure → the skill scan still attests,
+      // but the vuln coverage is UNAVAILABLE: the runtime gate must NOT silent-allow
+      // on it (unverified = unsafe). Never rethrow.
       summary.coverage = "unavailable";
       summary.note = summary.note ?? `dependency scan unavailable: ${depErr?.message ?? depErr}`;
     }
@@ -793,7 +855,10 @@ export async function auditSkillDir(skillDir, opts = {}) {
       basis: "scanned",
       manifestHash: key,
       rawFindings,
-      scanCoverage: summary.coverage ?? "unavailable",
+      // The cert tells the TRUTH about what was scanned. summary.coverage is the
+      // REAL coverage from deps (default 'unavailable'); it is never hardcoded to a
+      // clean value. Only 'transitive' + zero findings makes this a clean cert.
+      scanCoverage: normalizeCoverage(summary.coverage),
       scannerName: scannerName ?? null,
       vulnDbVersion: vulnDbVersion ?? null,
       timestampMs: Date.now(),
@@ -808,18 +873,31 @@ export async function auditSkillDir(skillDir, opts = {}) {
 }
 
 // Collect declared specs from every manifest file in the skill dir (bounded).
+//
+// Two distinct kinds of input feed Tier-1 metadata hygiene here:
+//   1. A real MANIFEST/LOCKFILE (requirements/pyproject/package.json/.py PEP723)
+//      → deps.parseManifestFile yields specs WITH versions where present; these can
+//      drive a transitive resolve+scan downstream and contribute CVE coverage.
+//   2. A bare-import JS/TS file with NO manifest → we extract the imported package
+//      NAMES (require()/import) so the Tier-1 metadata checks (typosquat / deny /
+//      allow) still apply. These specs carry NO version, so they CANNOT yield a
+//      transitive CVE scan → such a skill stays coverage 'unavailable' and is NOT
+//      stamped safe. (Honest limit: JS has no PEP-723 standard; bare imports give
+//      names, not versions.)
 function collectManifestSpecs(deps, skillDir, depsPolicy, summary) {
   const out = [];
+  let sawManifest = false;
   try {
     const entries = readdirSync(skillDir, { withFileTypes: true });
     for (const e of entries) {
       if (!e.isFile()) continue;
       const base = e.name.toLowerCase();
-      if (
+      const isManifest =
         base === "requirements.txt" || base === "pyproject.toml" || base === "uv.lock" ||
         base === "poetry.lock" || base === "package.json" || base === "package-lock.json" ||
-        base.endsWith(".py")
-      ) {
+        base.endsWith(".py");
+      if (isManifest) {
+        sawManifest = true;
         const specs = deps.parseManifestFile(join(skillDir, e.name));
         if (Array.isArray(specs)) out.push(...specs);
         if (depsPolicy && specs?.length) {
@@ -830,9 +908,135 @@ function collectManifestSpecs(deps, skillDir, depsPolicy, summary) {
         }
       }
     }
+
+    // Bare-import JS/TS (no manifest): extract imported package NAMES for Tier-1
+    // metadata ONLY. We do this whether or not a manifest exists, but the resulting
+    // specs are version-less — they raise typosquat/deny findings yet never let a
+    // skill claim CVE coverage. (Kept best-effort + bounded; never throws.)
+    const jsSpecs = collectBareImportSpecs(deps, skillDir, entries, depsPolicy, summary, out);
+    if (jsSpecs > 0 && !sawManifest) {
+      // Pure bare-import skill (names but no versions): leave a note so the cert's
+      // 'unavailable' coverage is explainable rather than silent.
+      if (!summary.note) {
+        summary.note = "JS bare imports detected with no manifest/lockfile — package names checked for typosquat/deny, but versions are unknown so CVE coverage is unavailable (skill not stamped safe).";
+      }
+    }
   } catch { /* unreadable dir → declared set stays empty */ }
   return out;
 }
+
+// Extract bare-import package names from .js/.mjs/.cjs files in the dir and feed
+// them through Tier-1 metadata as VERSION-LESS specs. Returns the count of
+// name-specs added. Never throws. Bounded by the same MAX_FILES budget.
+function collectBareImportSpecs(deps, skillDir, entries, depsPolicy, summary, out) {
+  let added = 0;
+  let scanned = 0;
+  for (const e of entries) {
+    if (scanned >= MAX_FILES) break;
+    if (!e.isFile()) continue;
+    const base = e.name.toLowerCase();
+    const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : "";
+    if (ext !== ".js" && ext !== ".mjs" && ext !== ".cjs") continue;
+    scanned++;
+    let text;
+    try {
+      const fd = openSync(join(skillDir, e.name), "r");
+      try {
+        const size = Math.min(statSync(join(skillDir, e.name)).size, MAX_SCAN_BYTES);
+        const buf = Buffer.allocUnsafe(size);
+        const n = size > 0 ? readSync(fd, buf, 0, size, 0) : 0;
+        text = buf.subarray(0, n).toString("utf-8");
+      } finally {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    } catch {
+      continue; // unreadable file → skip
+    }
+    const names = extractJsImportNames(text);
+    for (const name of names) {
+      // VERSION-LESS spec: a name only. spec/version stays absent so this can never
+      // be mistaken for a resolvable, scannable dependency (no CVE coverage).
+      const spec = { ecosystem: "npm", name, spec: "", source: `bare-import:${e.name}` };
+      out.push(spec);
+      added++;
+      if (depsPolicy) {
+        try {
+          const f = deps.scanDependencyMetadata([spec], depsPolicy, {});
+          for (const finding of f) {
+            summary.findings.push({ kind: finding.kind, severity: finding.severity, file: finding.package, detail: finding.detail });
+          }
+        } catch { /* metadata scan best-effort */ }
+      }
+    }
+  }
+  return added;
+}
+
+// Parse require()/import statements out of a JS/TS source body and return the set
+// of imported PACKAGE names (bare specifiers only — relative './x' and absolute
+// '/x' paths and Node builtins via 'node:' are excluded as they are not registry
+// packages). Scoped packages keep their '@scope/name'; a deep import 'pkg/sub' is
+// reduced to its package root ('pkg' or '@scope/name'). ReDoS-safe (bounded
+// quantifiers); never throws — returns [] on any error.
+export function extractJsImportNames(source) {
+  const text = String(source ?? "");
+  if (!text) return [];
+  const names = new Set();
+  // require('x') / require("x")  — bounded specifier length.
+  const requireRe = /\brequire\s*\(\s*["']([^"'\n]{1,200})["']\s*\)/g;
+  // import ... from 'x' / import 'x' / export ... from 'x' / dynamic import('x')
+  const importFromRe = /\bimport\b[^;'"\n]{0,200}?\bfrom\s*["']([^"'\n]{1,200})["']/g;
+  const bareImportRe = /\bimport\s*["']([^"'\n]{1,200})["']/g;
+  const dynImportRe = /\bimport\s*\(\s*["']([^"'\n]{1,200})["']\s*\)/g;
+  const exportFromRe = /\bexport\b[^;'"\n]{0,200}?\bfrom\s*["']([^"'\n]{1,200})["']/g;
+  for (const re of [requireRe, importFromRe, bareImportRe, dynImportRe, exportFromRe]) {
+    let m;
+    let guard = 0;
+    re.lastIndex = 0;
+    try {
+      while ((m = re.exec(text)) != null && guard++ < 2000) {
+        const root = packageRootFromSpecifier(m[1]);
+        if (root) names.add(root);
+        if (m.index === re.lastIndex) re.lastIndex++; // zero-width guard
+      }
+    } catch { /* a pathological body → skip this pattern, never throw */ }
+  }
+  return [...names].sort();
+}
+
+// Reduce an import specifier to its registry package root, or "" if it is not a
+// bare registry package (relative/absolute path, node: builtin, or empty).
+function packageRootFromSpecifier(specifier) {
+  const s = String(specifier ?? "").trim();
+  if (!s) return "";
+  // Relative or absolute path imports are local files, not registry packages.
+  if (s.startsWith(".") || s.startsWith("/") || s.startsWith("\\")) return "";
+  // Node builtins ('node:fs') and protocol-prefixed specifiers are not packages.
+  if (s.includes(":")) return "";
+  const parts = s.split("/");
+  if (s.startsWith("@")) {
+    // Scoped: @scope/name (drop any deeper subpath). Require both segments.
+    if (parts.length < 2 || !parts[0] || !parts[1]) return "";
+    return `${parts[0]}/${parts[1]}`;
+  }
+  // Unscoped: first path segment is the package; drop deep imports (pkg/sub).
+  const root = parts[0];
+  if (!root) return "";
+  // Bare Node builtins without the 'node:' prefix (fs, path, crypto, …) are not
+  // registry packages either; a small, common set is excluded to avoid noise.
+  if (NODE_BUILTIN_NAMES.has(root.toLowerCase())) return "";
+  return root;
+}
+
+// Common Node builtins that may be imported WITHOUT the 'node:' prefix — excluded
+// from bare-import name extraction so they are not mistaken for registry packages.
+const NODE_BUILTIN_NAMES = new Set([
+  "assert", "buffer", "child_process", "cluster", "console", "crypto", "dgram",
+  "dns", "domain", "events", "fs", "http", "http2", "https", "net", "os", "path",
+  "perf_hooks", "process", "punycode", "querystring", "readline", "repl",
+  "stream", "string_decoder", "timers", "tls", "tty", "url", "util", "v8", "vm",
+  "worker_threads", "zlib",
+]);
 
 // ── Runtime trigger detector (sync; pure) ────────────────────────────────────
 
@@ -1336,6 +1540,53 @@ async function resolveSymlinkForHashAsync(root, linkPath) {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+// Normalize a coverage value from deps.mjs onto the canonical vocabulary the
+// attestation gate understands: 'transitive' > 'declared-only' > 'unavailable'.
+// The legacy synonym 'full' maps to 'transitive'. ANY unrecognized / missing
+// value FAILS SAFE to 'unavailable' (never silently upgraded to a clean level) —
+// so a cert can only claim 'transitive' when deps explicitly reported it.
+function normalizeCoverage(coverage) {
+  const c = String(coverage ?? "").trim().toLowerCase();
+  if (c === "transitive" || c === "full") return "transitive";
+  if (c === "declared-only") return "declared-only";
+  return "unavailable";
+}
+
+/**
+ * Decide the HONEST scanCoverage for the legacy resolve+scan path (used until the
+ * sibling-owned deps.resolveAndScan lands). The legacy runVulnScanner reports
+ * 'full' whenever the chosen TOOL can scan a project tree — but that is a property
+ * of the tool, NOT proof THIS skill's deps were transitively resolved. So:
+ *   - scanner could not run (available:false)                → 'unavailable'
+ *   - a lockfile ACTUALLY drove resolution (fromLockfile)    → 'transitive'
+ *   - scanner ran but resolution was NOT transitive          → cap at 'declared-only'
+ *     (even if the tool claimed 'full'/'transitive' — no false clean)
+ * This is the precise guard against the bug that stamped an inline PEP-723 skill
+ * (no lockfile) as 'full' just because trivy scanned its directory. Pure; exported
+ * for tool-independent testing. NEVER returns 'transitive' without a lockfile.
+ *
+ * NOTE: the tool's own `claimedCoverage` is DELIBERATELY not trusted — `fromLockfile`
+ * is the only proof of a transitive resolve — so it is not a parameter here. Callers
+ * may pass it for context; it is intentionally ignored.
+ *
+ * @param {{available:boolean, fromLockfile:boolean}} args
+ * @returns {'transitive'|'declared-only'|'unavailable'}
+ */
+export function decideScanCoverage({ available, fromLockfile } = {}) {
+  if (!available) {
+    return "unavailable";
+  }
+  if (fromLockfile === true) {
+    // Lockfile drove resolution AND the scanner ran → genuinely transitive.
+    return "transitive";
+  }
+  // Scanner ran but resolution was not transitive (no lockfile). Whatever the tool
+  // claimed ('full'/'transitive'/'declared-only'/unknown), the honest ceiling here
+  // is 'declared-only': a scan DID look at the declared set, but the transitive
+  // tree was never resolved, so this is NEVER a clean 'transitive' bill.
+  return "declared-only";
+}
 
 function compileSig(sig) {
   try {

@@ -13,6 +13,9 @@ import { join } from "node:path";
 import {
   compileSkillPolicy,
   scanSkill,
+  auditSkillDir,
+  extractJsImportNames,
+  decideScanCoverage,
   skillFileHashesSync,
   skillHasUnhashableEntries,
   checkSkillInvocationMeta,
@@ -21,7 +24,11 @@ import {
   SKILL_SECRET_PATTERNS,
   CAPABILITY_DIMENSIONS,
 } from "./skills.mjs";
-import { skillIntegrityKey } from "./attestation.mjs";
+import {
+  skillIntegrityKey,
+  readAttestation,
+  decideFromFindings,
+} from "./attestation.mjs";
 
 let fail = 0;
 const ok = (name, cond) => { console.log(`${cond ? "PASS" : "FAIL"}  ${name}`); if (!cond) fail++; };
@@ -413,6 +420,151 @@ ok("robustness: builtin pattern sets are non-empty",
   const r2 = await scanSkill(fp2, policy);
   ok("item9: a real disable-governance instruction STILL trips",
     hasDetail(r2.findings, "injection", "disable-governance"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SECURITY: no false-clean stamp + bare-import name extraction (the invariant)
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Bare-import JS name extraction (Tier-1 metadata; tool-independent) ────────
+{
+  const src = [
+    "import express from 'express';",
+    "import { readFile } from 'node:fs/promises';", // node: builtin → excluded
+    "import fs from 'fs';",                          // bare builtin → excluded
+    "const lodash = require('lodash');",
+    "const sub = require('lodash/fp');",            // deep import → root 'lodash'
+    "import scoped from '@aws-sdk/client-s3';",     // scoped → '@aws-sdk/client-s3'
+    "import local from './helper.js';",             // relative → excluded
+    "import abs from '/etc/x';",                     // absolute → excluded
+    "const dyn = await import('chalk');",           // dynamic import
+    "export { x } from 'react';",                    // export ... from
+  ].join("\n");
+  const names = extractJsImportNames(src);
+  ok("bare-import: extracts registry package names",
+    names.includes("express") && names.includes("lodash") && names.includes("chalk") && names.includes("react"));
+  ok("bare-import: scoped package kept whole (@scope/name)",
+    names.includes("@aws-sdk/client-s3"));
+  ok("bare-import: deep import reduced to package root (lodash, once)",
+    names.filter((n) => n === "lodash").length === 1);
+  ok("bare-import: node: builtins and bare builtins excluded",
+    !names.includes("fs") && !names.some((n) => n.startsWith("node:")));
+  ok("bare-import: relative/absolute path imports excluded",
+    !names.some((n) => n.startsWith(".") || n.startsWith("/")));
+  ok("bare-import: never throws on garbage input, returns array",
+    Array.isArray(extractJsImportNames(null)) && Array.isArray(extractJsImportNames("require(")));
+}
+
+// ── decideScanCoverage: the false-clean cap (tool-INDEPENDENT, the shipped bug) ─
+// THE EXACT BUG: trivy/osv report 'full' for any project dir they can scan, so an
+// inline PEP-723 skill with NO lockfile got stamped 'full' → false clean. The cap
+// must downgrade any non-lockfile-backed 'full' claim to 'declared-only'.
+{
+  // scanner couldn't run → unavailable (fail-safe), regardless of any claim.
+  ok("cap: available:false → 'unavailable' (no scan, not clean)",
+    decideScanCoverage({ available: false, fromLockfile: false, claimedCoverage: "full" }) === "unavailable");
+  // THE FIX: a tool 'full' claim with NO lockfile is capped to 'declared-only'.
+  ok("cap: trivy 'full' claim + NO lockfile → 'declared-only' (false-clean blocked)",
+    decideScanCoverage({ available: true, fromLockfile: false, claimedCoverage: "full" }) === "declared-only");
+  ok("cap: 'transitive' claim + NO lockfile → 'declared-only' (no unproven clean)",
+    decideScanCoverage({ available: true, fromLockfile: false, claimedCoverage: "transitive" }) === "declared-only");
+  // A lockfile ACTUALLY drove resolution → 'transitive' is honest.
+  ok("cap: lockfile-backed scan → 'transitive' (genuinely clean-eligible)",
+    decideScanCoverage({ available: true, fromLockfile: true, claimedCoverage: "full" }) === "transitive");
+  // It can NEVER return 'transitive' without a lockfile (the core invariant).
+  ok("cap: NEVER returns 'transitive' without a lockfile",
+    decideScanCoverage({ available: true, fromLockfile: false, claimedCoverage: "transitive" }) !== "transitive" &&
+    decideScanCoverage({ available: true, fromLockfile: false, claimedCoverage: "full" }) !== "transitive" &&
+    decideScanCoverage({ available: true, fromLockfile: false }) !== "transitive");
+}
+
+// ── auditSkillDir stamps HONEST coverage; an unverified skill is NEVER clean ──
+// Point the attestation cache at a temp dir so the proactive cert write is
+// isolated. The KEY assertions are tool-INDEPENDENT: regardless of whether a
+// resolver/scanner is installed, a skill whose deps cannot be transitively
+// resolved+scanned must get a cert whose scanCoverage is NOT 'transitive'/'full',
+// so the ENFORCE gate treats it as UNVERIFIED (review), never silent-allow.
+{
+  const dataDir = mkdtempSync(join(tmpdir(), "agt-skill-audit-"));
+  const prevStore = process.env.AGT_SESSION_STORE;
+  const prevData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.AGT_SESSION_STORE = "disk";
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+  const enforce = { mode: "enforce", severityThreshold: "high" };
+  try {
+    // (1) A skill with a PEP 723 inline dep but NO lockfile and (in this env) no
+    // resolver/scanner → coverage can only be 'declared-only' or 'unavailable',
+    // NEVER 'transitive'. The cert must NOT be a clean silent-allow.
+    const inlineSkill = join(base, "skills", "pep723-inline");
+    mkdirSync(inlineSkill, { recursive: true });
+    writeFileSync(join(inlineSkill, "SKILL.md"), "# Inline\nRuns an inline Python script.");
+    writeFileSync(join(inlineSkill, "run.py"), [
+      "# /// script",
+      "# dependencies = [\"jinja2==2.10\", \"PyYAML==5.1\"]",
+      "# ///",
+      "import jinja2",
+      "print('hi')",
+    ].join("\n"));
+    const skillPolicy = compileSkillPolicy({ enabled: true, mode: "enforce" });
+    const sum = await auditSkillDir(inlineSkill, { skillPolicy, depsPolicy: null });
+
+    ok("audit: never throws, returns a summary with a coverage",
+      sum && typeof sum === "object" && typeof sum.coverage === "string");
+    ok("audit: coverage is one of the honest levels (transitive/declared-only/unavailable; the obsolete 'full' is gone)",
+      ["transitive", "declared-only", "unavailable"].includes(sum.coverage));
+    ok("audit: persisted a cert keyed to the skill's integrity key",
+      sum.persisted === true && /^[a-f0-9]{64}$/.test(String(sum.key)));
+
+    const cert = readAttestation(sum.key);
+    ok("audit: the persisted cert reads back with the SAME honest coverage",
+      cert && cert.basis === "scanned" && cert.scanCoverage === sum.coverage);
+    // No false-CLEAN, tools-robust: this fixture is VULNERABLE (jinja2==2.10), so
+    // if a resolver+scanner WAS present it is correctly scanned 'transitive' — but
+    // then it MUST carry the CVEs, so it can never be a clean transitive stamp.
+    // Without tools it's 'declared-only'/'unavailable' (also never clean). Either
+    // way: not a false-clean. (The gate-level invariant is asserted just below.)
+    ok("audit: a vulnerable skill is never a clean transitive stamp (transitive ⇒ carries findings)",
+      cert && (cert.scanCoverage !== "transitive" ||
+        (cert.rawFindings ?? []).some((f) => f.severity === "high" || f.severity === "critical")));
+
+    // THE FAIL-SAFE: the gate over this cert must be review (enforce), never allow,
+    // UNLESS a real scanner happened to find a vulnerability — in which case it
+    // must DENY. Either way it is NEVER a silent allow.
+    const decision = decideFromFindings(cert, enforce);
+    const hasVuln = (cert.rawFindings ?? []).some((f) => f.severity === "high" || f.severity === "critical");
+    ok("audit: unverified inline skill is NEVER silent-allowed (review, or deny if a CVE was found)",
+      decision.effect === "review" || (hasVuln && decision.effect === "deny"));
+    ok("audit: the gate decision for an unverified skill is specifically NOT 'allow'",
+      decision.effect !== "allow");
+
+    // (2) A skill with NO deps at all and no resolver → still not 'transitive'.
+    const noDeps = join(base, "skills", "no-deps");
+    mkdirSync(noDeps, { recursive: true });
+    writeFileSync(join(noDeps, "SKILL.md"), "# NoDeps\nLocal markdown formatter.");
+    writeFileSync(join(noDeps, "x.py"), "print('no third-party imports')\n");
+    const sum2 = await auditSkillDir(noDeps, { skillPolicy, depsPolicy: null });
+    ok("audit: a skill with no resolvable+scanned deps gets non-clean coverage",
+      sum2.coverage !== "transitive" && sum2.coverage !== "full");
+    const cert2 = readAttestation(sum2.key);
+    ok("audit: that cert's enforce gate is NOT a silent allow",
+      decideFromFindings(cert2, enforce).effect !== "allow");
+
+    // (3) Bare-import JS with NO manifest → names extracted for Tier-1, but the
+    // CVE coverage is 'unavailable' (names, no versions) → NOT stamped safe.
+    const jsSkill = join(base, "skills", "bare-js");
+    mkdirSync(jsSkill, { recursive: true });
+    writeFileSync(join(jsSkill, "SKILL.md"), "# BareJS\nRuns a node script.");
+    writeFileSync(join(jsSkill, "run.js"), "const express = require('express');\nexpress();\n");
+    const sum3 = await auditSkillDir(jsSkill, { skillPolicy, depsPolicy: null });
+    ok("audit: a bare-import JS skill (no manifest) is NEVER stamped 'transitive'/'full'",
+      sum3.coverage !== "transitive" && sum3.coverage !== "full");
+    ok("audit: bare-import JS skill cert's enforce gate is NOT a silent allow",
+      decideFromFindings(readAttestation(sum3.key), enforce).effect !== "allow");
+  } finally {
+    if (prevStore === undefined) delete process.env.AGT_SESSION_STORE; else process.env.AGT_SESSION_STORE = prevStore;
+    if (prevData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevData;
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────────────

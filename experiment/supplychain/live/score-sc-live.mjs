@@ -170,12 +170,21 @@ async function scoreScanner(scanner, fixtures, timeoutMs) {
     // scanner forced to this tool over the fixture directory. resolveTransitive
     // tells the scanner whether a lockfile drove resolution (coverage signal).
     const declared = parseManifestFile(join(dir, fx.manifest));
-    const { resolved, fromLockfile } = await resolveTransitive(declared, { cwd: dir });
-    const scan = await runVulnScanner(resolved, {
+    const res = await resolveTransitive(declared, { cwd: dir });
+    // Hand the scanner the resolver-produced scanDir (the SHIPPED orchestration:
+    // resolveTransitive materializes the full transitive set under a scanner-
+    // recognized basename, then runVulnScanner scans THAT). This is what carries a
+    // "transitive" coverage stamp and is REQUIRED for an inline PEP 723 fixture: the
+    // fixture dir holds only a .py, which trivy/osv do not natively parse — uv export
+    // first writes a requirements.txt into scanDir, which the scanner then reads. We
+    // fall back to scanning the fixture dir directly only when no scanDir was produced
+    // (coverage then degrades to "unavailable", per the plugin's honesty contract).
+    const scan = await runVulnScanner(res.resolved, {
+      scanDir: res.scanDir,
+      coverage: res.coverage,
       cwd: dir,
       scannerCmd: scanner,
       timeoutMs,
-      fromLockfile,
     });
     const verdict = judge(fx, scanner, scan);
     results.push({

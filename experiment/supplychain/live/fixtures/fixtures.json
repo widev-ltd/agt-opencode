@@ -68,6 +68,19 @@
       }
     },
     {
+      "id": "py-inline-jinja2-2.10",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-inline-jinja2-2.10",
+      "manifest": "render.py",
+      "packages": ["jinja2==2.10 (PEP 723 inline)"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2019-10906", "CVE-2020-28493", "CVE-2024-22195"],
+        "note": "INLINE twin of py-jinja2-2.10: jinja2==2.10 declared via a PEP 723 '# /// script' block inside a .py. Exercises the shipped resolveTransitive PEP-723 path (uv export --script) so the scanner sees the full transitive set resolved from an INLINE block, demonstrating inline transitive CVE detection end-to-end (not just requirements.txt). Same advisories as the requirements.txt twin."
+      }
+    },
+    {
       "id": "py-mixed-vuln",
       "ecosystem": "pypi",
       "class": "vulnerable",

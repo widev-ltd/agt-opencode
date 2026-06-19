@@ -1,0 +1,348 @@
+{
+  "track": "supplychain-live-cve-detection",
+  "sealed": false,
+  "date": "2026-06-19",
+  "generatedAt": "2026-06-19T19:45:32.187Z",
+  "node": "v24.11.0",
+  "pluginSource": "../../../plugins/agt-governance/scripts/deps.mjs",
+  "fixturesAuthored": "2026-06-19",
+  "fixtureCount": 14,
+  "determinismCaveat": "NOT byte-sealed. Findings depend on each scanner's vuln DB, which updates over time. Re-running on a different day / DB version can change counts and may flip a borderline fixture. Scoring is at the severity-band level (>=1 high/critical for vulnerable, 0 high/critical for clean), not an exact-CVE-id match. pip-audit JSON omits per-vuln severity; the plugin bands all pip-audit findings to medium, so pip-audit is scored on an any-severity rule and reads declared-only coverage.",
+  "scanners": [
+    {
+      "scanner": "trivy",
+      "available": true,
+      "dbVersion": "Version: 0.71.1",
+      "fixtures": [
+        {
+          "id": "py-jinja2-2.10",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "jinja2==2.10"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 6,
+          "bands": {
+            "critical": 0,
+            "high": 1,
+            "medium": 5,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 1,
+          "verdict": "caught",
+          "detail": "1 high, 5 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "py-pyyaml-5.1",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "PyYAML==5.1"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 3,
+          "bands": {
+            "critical": 3,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 3,
+          "verdict": "caught",
+          "detail": "3 critical",
+          "scannerNote": null
+        },
+        {
+          "id": "py-requests-2.19.1",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "requests==2.19.1"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 18,
+          "bands": {
+            "critical": 0,
+            "high": 6,
+            "medium": 12,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 6,
+          "verdict": "caught",
+          "detail": "6 high, 12 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "py-urllib3-1.24.1",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "urllib3==1.24.1"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 12,
+          "bands": {
+            "critical": 0,
+            "high": 6,
+            "medium": 6,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 6,
+          "verdict": "caught",
+          "detail": "6 high, 6 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "py-flask-0.12",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "Flask==0.12"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 4,
+          "bands": {
+            "critical": 0,
+            "high": 3,
+            "medium": 0,
+            "low": 1,
+            "info": 0
+          },
+          "highCritical": 3,
+          "verdict": "caught",
+          "detail": "3 high, 1 low",
+          "scannerNote": null
+        },
+        {
+          "id": "py-inline-jinja2-2.10",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "jinja2==2.10 (PEP 723 inline)"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 6,
+          "bands": {
+            "critical": 0,
+            "high": 1,
+            "medium": 5,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 1,
+          "verdict": "caught",
+          "detail": "1 high, 5 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "py-mixed-vuln",
+          "class": "vulnerable",
+          "ecosystem": "pypi",
+          "packages": [
+            "jinja2==2.10",
+            "PyYAML==5.1",
+            "requests==2.19.1",
+            "urllib3==1.24.1",
+            "Flask==0.12"
+          ],
+          "available": true,
+          "coverage": "unavailable",
+          "findingsTotal": 30,
+          "bands": {
+            "critical": 3,
+            "high": 11,
+            "medium": 15,
+            "low": 1,
+            "info": 0
+          },
+          "highCritical": 14,
+          "verdict": "caught",
+          "detail": "3 critical, 11 high, 15 medium, 1 low",
+          "scannerNote": null
+        },
+        {
+          "id": "npm-lodash-4.17.4",
+          "class": "vulnerable",
+          "ecosystem": "npm",
+          "packages": [
+            "lodash@4.17.4"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 10,
+          "bands": {
+            "critical": 1,
+            "high": 4,
+            "medium": 4,
+            "low": 1,
+            "info": 0
+          },
+          "highCritical": 5,
+          "verdict": "caught",
+          "detail": "1 critical, 4 high, 4 medium, 1 low",
+          "scannerNote": null
+        },
+        {
+          "id": "npm-minimist-1.2.0",
+          "class": "vulnerable",
+          "ecosystem": "npm",
+          "packages": [
+            "minimist@1.2.0"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 2,
+          "bands": {
+            "critical": 1,
+            "high": 0,
+            "medium": 1,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 1,
+          "verdict": "caught",
+          "detail": "1 critical, 1 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "npm-node-fetch-2.6.0",
+          "class": "vulnerable",
+          "ecosystem": "npm",
+          "packages": [
+            "node-fetch@2.6.0"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 2,
+          "bands": {
+            "critical": 0,
+            "high": 1,
+            "medium": 0,
+            "low": 1,
+            "info": 0
+          },
+          "highCritical": 1,
+          "verdict": "caught",
+          "detail": "1 high, 1 low",
+          "scannerNote": null
+        },
+        {
+          "id": "npm-mixed-vuln",
+          "class": "vulnerable",
+          "ecosystem": "npm",
+          "packages": [
+            "lodash@4.17.4",
+            "minimist@1.2.0",
+            "node-fetch@2.6.0"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 14,
+          "bands": {
+            "critical": 2,
+            "high": 5,
+            "medium": 5,
+            "low": 2,
+            "info": 0
+          },
+          "highCritical": 7,
+          "verdict": "caught",
+          "detail": "2 critical, 5 high, 5 medium, 2 low",
+          "scannerNote": null
+        },
+        {
+          "id": "clean-py-pinned",
+          "class": "clean",
+          "ecosystem": "pypi",
+          "packages": [
+            "jinja2==3.1.6",
+            "requests==2.32.3",
+            "certifi==2024.8.30"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 2,
+          "bands": {
+            "critical": 0,
+            "high": 0,
+            "medium": 2,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 0,
+          "verdict": "clean",
+          "detail": "2 medium",
+          "scannerNote": null
+        },
+        {
+          "id": "clean-npm-pinned",
+          "class": "clean",
+          "ecosystem": "npm",
+          "packages": [
+            "chalk@5.3.0",
+            "ms@2.1.3"
+          ],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 0,
+          "bands": {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 0,
+          "verdict": "clean",
+          "detail": "0 findings",
+          "scannerNote": null
+        },
+        {
+          "id": "clean-py-stdlib-only",
+          "class": "clean",
+          "ecosystem": "pypi",
+          "packages": [],
+          "available": true,
+          "coverage": "transitive",
+          "findingsTotal": 0,
+          "bands": {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "info": 0
+          },
+          "highCritical": 0,
+          "verdict": "clean",
+          "detail": "0 findings",
+          "scannerNote": null
+        }
+      ],
+      "summary": {
+        "vulnerableTotal": 11,
+        "vulnerableMeasured": 11,
+        "caught": 11,
+        "vulnerableNotMeasured": 0,
+        "coveragePct": 100,
+        "cleanTotal": 3,
+        "cleanMeasured": 3,
+        "cleanOk": 3,
+        "falsePositives": 0,
+        "cleanNotMeasured": 0,
+        "cleanPct": 100
+      }
+    }
+  ]
+}

@@ -132,7 +132,7 @@ the same threat rules + extensions; they differ only in the tool tiers / mode:
 
 ### Governance extensions
 
-The policy enables four extra layers (configure each in the policy file;
+The policy enables six extra layers (configure each in the policy file;
 `mode: "advisory"` warns, `mode: "enforce"` blocks):
 
 | Extension | Default | What it does |
@@ -141,6 +141,20 @@ The policy enables four extra layers (configure each in the policy file;
 | **Exfiltration** (`exfilPolicies`) | enforce | Session-aware: blocks an outbound request that embeds a credential value seen earlier in tool output. |
 | **Rate-limit** (`rateLimitPolicies`) | advisory | Per-session, per-tool call budgets. |
 | **Content-safety** (`contentSafetyPolicies`) | advisory | Harmful-instruction / jailbreak / credential-social-engineering scan; optional external API. |
+| **Dependency** (`dependencyPolicies`) | advisory | Supply-chain hygiene over a skill's / install command's deps — typosquat, unpinned, denied, non-registry/editable, untrusted index, npm install-scripts, license — across Python (PEP 723 inline, requirements, pyproject) and Node (package.json, lockfiles). |
+| **Skill** (`skillPolicies`) | advisory | Governs a skill before it runs: integrity attestation, dangerous-pattern / secret / injection / capability scans, source allowlist, and the scan-once attestation that drives the transitive CVE gate. |
+
+**Skill & dependency supply-chain governance.** Tier 1 (runtime, in-process, no
+network) parses a skill's manifests (incl. PEP 723 inline) + does metadata hygiene
++ an attestation lookup. Tier 2 (`skills audit`, off the hot path) resolves the
+**full transitive tree** (`uv`/`npm`) and runs an auto-detected scanner (trivy /
+osv-scanner / pip-audit) for CVEs, then writes a `scanned` attestation so a later
+run is a cheap cache hit. **Fail-safe guarantee:** a skill is allowed silently only
+when its deps were actually resolved transitively AND scanned clean; if they can't
+be (no resolver/scanner, resolver error, bare-import JS with no manifest) coverage
+is `unavailable` → unverified = unsafe (review/deny), never a false-clean. The
+proactive audit needs `uv`/`npm` + a scanner on `PATH`; their absence fails safe.
+Methodology + measured numbers: `experiment/supplychain/BENCHMARK.md`.
 
 OpenCode runs the plugin **resident in-process**, so the stateful extensions
 (exfil, rate-limit) keep per-session state in memory (the Claude Code seat,

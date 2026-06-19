@@ -45,7 +45,8 @@
 // this module exposes a thin integration helper (attestDepsScan) that imports it
 // lazily so deps.mjs has no hard dependency on attestation at load time.
 
-import { statSync, openSync, readSync, closeSync, readFileSync, readdirSync } from "node:fs";
+import { statSync, openSync, readSync, closeSync, readFileSync, readdirSync, mkdtempSync, writeFileSync, copyFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 // Bound every file/command read so a hostile multi-GB manifest cannot exhaust
 // memory or stall the sync decision path.
@@ -701,73 +702,90 @@ export function depsDecision(findings, policy) {
 }
 
 // ── Tier-2: transitive resolution + vulnerability scanner (ASYNC) ────────────
+//
+// COVERAGE VOCABULARY (the security contract — see SC-SECURITY-REMEDIATION.md):
+//   "transitive"    — a resolver produced the FULL transitive tree AND a real
+//                     scanner scanned it. ONLY this, with zero findings, may be a
+//                     clean silent-allow.
+//   "declared-only" — only the DECLARED set was scanned (no transitive expansion,
+//                     e.g. a pre-existing lockfile we could only parse, or
+//                     pip-audit -r over a requirements file). Not silent-allow.
+//   "unavailable"   — nothing was reliably resolved+scanned (no resolver, no
+//                     scanner, a resolver/scanner error, a timeout, a TLS failure,
+//                     or an inline form we cannot resolve). The caller treats this
+//                     as UNVERIFIED = UNSAFE. A zero-findings "unavailable" result
+//                     is NEVER clean.
+//
+// THE INVARIANT: we NEVER report "transitive" for a set that was not actually
+// resolved by a resolver AND scanned by a scanner. When in doubt → "unavailable".
+//
+// Resolvers (uv / npm) are spawned ONLY from this async proactive path, never on
+// the synchronous runtime hot path, and every spawn is timeout-bounded and total
+// (never throws). The runtime decision path stays scanner-/resolver-free.
 
-/**
- * Best-effort transitive resolution. If a lockfile is present in `cwd` we read
- * the fully-resolved set from it; otherwise we return the declared set plus a
- * note that real resolution needs a resolver (we do NOT shell out to one here).
- * @returns {Promise<{resolved:object[], fromLockfile:boolean, note?:string}>}
- */
-export async function resolveTransitive(specs, { cwd = "" } = {}) {
-  const lockfiles = ["uv.lock", "poetry.lock", "package-lock.json"];
-  for (const lf of lockfiles) {
-    const text = readBoundedSync(joinPath(cwd, lf));
-    if (text != null) {
-      const resolved = parseManifestFile(joinPath(cwd, lf));
-      if (resolved.length) return { resolved, fromLockfile: true };
-    }
-  }
-  return {
-    resolved: Array.isArray(specs) ? specs.slice(0, MAX_SPECS) : [],
-    fromLockfile: false,
-    note: "No lockfile found; reporting the DECLARED dependency set only. Transitive resolution requires running a resolver (pip/uv/npm), which this audit does not do.",
-  };
-}
-
-// Scanner adapters in detection order: each knows how to probe, build args, and
-// parse its JSON into a common rawFindings shape. `buildArgs(cwd)` may return null
-// to mean "I have no input to scan here" (e.g. pip-audit with no requirements file)
-// — runVulnScanner then degrades to available:false rather than scanning the wrong
-// thing. `scansLockfile` is true when the tool resolves a lockfile / project tree
-// (so coverage can be reported as full), false when it only sees the declared set.
-const SCANNERS = [
+// Resolver adapters. Each knows how to probe for the tool and, given the manifests
+// reachable from `cwd`, run the resolver into a temp `scanDir` containing a file
+// under the SCANNER-RECOGNIZED basename (trivy/osv detect pip by `requirements.txt`
+// and npm by `package-lock.json`). `resolve(...)` returns
+//   { ok:true, scanDir, method, note }  on a real transitive resolution, or
+//   { ok:false, note }                  when it cannot resolve (→ caller fails safe).
+// Never throws.
+const RESOLVERS = [
   {
-    name: "trivy",
+    name: "uv",
+    ecosystem: "pypi",
     versionArgs: ["--version"],
-    buildArgs: (cwd) => ["fs", "--scanners", "vuln", "--format", "json", "--quiet", cwd || "."],
-    parse: parseTrivyJson,
-    scansLockfile: true,
+    resolve: resolveWithUv,
   },
   {
-    name: "osv-scanner",
+    name: "npm",
+    ecosystem: "npm",
     versionArgs: ["--version"],
-    buildArgs: (cwd) => ["--format", "json", "--recursive", cwd || "."],
-    parse: parseOsvJson,
-    scansLockfile: true,
-  },
-  {
-    name: "pip-audit",
-    versionArgs: ["--version"],
-    // pip-audit with NO target audits the AMBIENT environment (wrong, and often
-    // empty/misleading). Always scan the requirements/constraints files present in
-    // cwd via `-r`; if there are none, return null so the scan is reported
-    // unavailable instead of silently auditing the host interpreter.
-    buildArgs: (cwd) => {
-      const reqs = findRequirementsFiles(cwd);
-      if (reqs.length === 0) return null;
-      const args = ["--format", "json", "--progress-spinner", "off"];
-      for (const f of reqs) { args.push("-r", f); }
-      return args;
-    },
-    parse: parsePipAuditJson,
-    // pip-audit -r reads the DECLARED requirements set, not a resolved lockfile.
-    scansLockfile: false,
+    resolve: resolveWithNpm,
   },
 ];
 
-// List requirements/constraints files in cwd (non-recursive, bounded). Returns
-// absolute-ish paths suitable for `pip-audit -r`. Never throws.
-function findRequirementsFiles(cwd) {
+// Detect which Python manifest (if any) we can hand to `uv export`. PEP 723 inline
+// .py and requirements*/pyproject.toml are all resolvable; a pre-existing uv.lock
+// also resolves. Returns { kind, path } or null.
+function detectPythonManifest(cwd, manifests) {
+  const candidates = Array.isArray(manifests) && manifests.length
+    ? manifests
+    : listManifestCandidates(cwd);
+  // Prefer an inline PEP 723 script, then pyproject, then requirements, then lock.
+  const byPriority = [
+    (b) => b.endsWith(".py"),
+    (b) => b === "pyproject.toml",
+    (b) => isRequirementsTxtName(b),
+    (b) => b === "uv.lock",
+  ];
+  for (const test of byPriority) {
+    for (const p of candidates) {
+      const base = basename(p).toLowerCase();
+      if (!test(base)) continue;
+      // A .py is only a Python manifest if it actually carries a PEP 723 block.
+      if (base.endsWith(".py")) {
+        const text = readBoundedSync(p);
+        if (text == null || parsePep723(text).length === 0) continue;
+      }
+      return { kind: base.endsWith(".py") ? "pep723" : base, path: p };
+    }
+  }
+  return null;
+}
+
+function detectNodeManifest(cwd, manifests) {
+  const candidates = Array.isArray(manifests) && manifests.length
+    ? manifests
+    : listManifestCandidates(cwd);
+  for (const p of candidates) {
+    if (basename(p).toLowerCase() === "package.json") return { kind: "package.json", path: p };
+  }
+  return null;
+}
+
+// List manifest-ish files in cwd (non-recursive, bounded). Never throws.
+function listManifestCandidates(cwd) {
   if (!cwd) return [];
   let entries;
   try {
@@ -777,19 +795,310 @@ function findRequirementsFiles(cwd) {
   }
   const out = [];
   for (const name of entries) {
+    if (out.length >= 256) break;
+    const base = String(name).toLowerCase();
+    if (
+      base.endsWith(".py") ||
+      base === "pyproject.toml" ||
+      base === "uv.lock" ||
+      base === "poetry.lock" ||
+      base === "package.json" ||
+      base === "package-lock.json" ||
+      isRequirementsTxtName(base)
+    ) {
+      out.push(joinPath(cwd, name));
+    }
+  }
+  return out;
+}
+
+// Run `uv export` to produce the pinned TRANSITIVE requirement set, written into a
+// fresh temp dir as `requirements.txt` (the name trivy/osv use to detect pip deps).
+// UV_SYSTEM_CERTS=1 lets uv trust this machine's TLS-intercepting CA. Returns
+// { ok, scanDir, method, note } / { ok:false, note }. Never throws.
+async function resolveWithUv(manifest, { cwd = "", timeoutMs = 120000 } = {}) {
+  const env = { ...process.env, UV_SYSTEM_CERTS: "1" };
+  const scanDir = makeScanDir();
+  if (!scanDir) return { ok: false, note: "uv: a temp scan dir could not be created." };
+
+  // Build the uv args and the cwd to run in. For a PROJECT manifest (pyproject.toml
+  // / uv.lock), uv discovers the project by walking UP the directory tree — which,
+  // for a manifest nested under another project, finds (and fails on) the WRONG
+  // parent. We sidestep that by copying the project files into an ISOLATED dir (the
+  // scanDir) with no parent project, exactly as the npm path isolates package.json.
+  let args;
+  let runCwd = cwd;
+  if (manifest.kind === "pep723") {
+    // Inline script: explicit --script path, no walk-up. No isolation needed.
+    args = ["export", "--script", manifest.path, "--format", "requirements-txt", "--no-hashes", "--no-header"];
+  } else if (isRequirementsTxtName(String(manifest.kind))) {
+    // Bare requirements file: `uv pip compile <file>` resolves the transitive set
+    // to stdout from the explicit path; no project walk-up.
+    args = ["pip", "compile", manifest.path, "--no-header"];
+  } else if (manifest.kind === "pyproject.toml" || manifest.kind === "uv.lock") {
+    // Copy the project's pyproject.toml (+ a sibling uv.lock when present, so an
+    // existing pin set is honored) into the isolated scanDir and resolve THERE.
+    try {
+      const srcDir = dirOf(manifest.path);
+      const pyproj = joinPath(srcDir, "pyproject.toml");
+      if (readBoundedSync(pyproj) != null) copyFileSync(pyproj, joinPath(scanDir, "pyproject.toml"));
+      const lock = joinPath(srcDir, "uv.lock");
+      if (readBoundedSync(lock) != null) copyFileSync(lock, joinPath(scanDir, "uv.lock"));
+    } catch (e) {
+      return { ok: false, note: `uv: copying project files into the scan dir failed: ${String(e?.message ?? e)}` };
+    }
+    args = ["export", "--format", "requirements-txt", "--no-hashes", "--no-header"];
+    runCwd = scanDir; // resolve inside the isolated copy — no parent to discover
+  } else {
+    return { ok: false, note: `uv: unsupported manifest kind '${manifest.kind}'.` };
+  }
+
+  const run = await spawnCapture("uv", args, { cwd: runCwd, timeoutMs, env });
+  if (run.spawnError) return { ok: false, note: `uv could not be spawned: ${truncate(run.stderr, 160)}` };
+  if (run.timedOut) return { ok: false, note: `uv export timed out after ${timeoutMs} ms.` };
+  if (run.code !== 0) return { ok: false, note: `uv export failed (exit ${run.code}): ${truncate(run.stderr, 200)}` };
+  // The pinned requirement lines are on STDOUT ("Resolved N packages" goes to
+  // stderr). An empty resolve (a manifest with no deps) is still a valid clean
+  // transitive result — write an (empty) requirements.txt so the scanner sees it.
+  const body = String(run.stdout ?? "");
+  try {
+    // requirements.txt is the basename trivy/osv use to detect pip deps. (For the
+    // pyproject path the scanDir also holds the copied pyproject.toml/uv.lock, which
+    // is fine — the resolved requirements.txt is what carries the transitive pins.)
+    writeFileSync(joinPath(scanDir, "requirements.txt"), body);
+  } catch (e) {
+    return { ok: false, note: `uv resolved deps but writing requirements.txt failed: ${String(e?.message ?? e)}` };
+  }
+  return { ok: true, scanDir, method: "uv", note: `uv resolved transitive deps from ${manifest.kind}.` };
+}
+
+// Run `npm install --package-lock-only` to produce package-lock.json (the full
+// resolved tree) in a temp dir holding a COPY of the package.json, then hand that
+// dir to the scanner. NODE_OPTIONS=--use-system-ca trusts the machine's TLS CA.
+// Returns { ok, scanDir, method, note } / { ok:false, note }. Never throws.
+async function resolveWithNpm(manifest, { timeoutMs = 120000 } = {}) {
+  const scanDir = makeScanDir();
+  if (!scanDir) return { ok: false, note: "npm: a temp scan dir could not be created." };
+  try {
+    copyFileSync(manifest.path, joinPath(scanDir, "package.json"));
+  } catch (e) {
+    return { ok: false, note: `npm: copying package.json into the scan dir failed: ${String(e?.message ?? e)}` };
+  }
+  const env = { ...process.env, NODE_OPTIONS: appendNodeOption(process.env.NODE_OPTIONS, "--use-system-ca") };
+  const run = await spawnCapture("npm", ["install", "--package-lock-only", "--no-audit", "--no-fund"], { cwd: scanDir, timeoutMs, env });
+  if (run.spawnError) return { ok: false, note: `npm could not be spawned: ${truncate(run.stderr, 160)}` };
+  if (run.timedOut) return { ok: false, note: `npm install --package-lock-only timed out after ${timeoutMs} ms.` };
+  // npm exits non-zero on resolution errors; only treat a written lockfile as success.
+  const lock = readBoundedSync(joinPath(scanDir, "package-lock.json"));
+  if (lock == null) {
+    return { ok: false, note: `npm did not produce a package-lock.json (exit ${run.code}): ${truncate(run.stderr, 200)}` };
+  }
+  return { ok: true, scanDir, method: "npm", note: "npm resolved the transitive tree into package-lock.json." };
+}
+
+// Append a flag to NODE_OPTIONS without clobbering an existing value or duplicating.
+function appendNodeOption(existing, flag) {
+  const cur = String(existing ?? "").trim();
+  if (!cur) return flag;
+  return cur.includes(flag) ? cur : `${cur} ${flag}`;
+}
+
+// Create a fresh temp dir for resolver output. Returns the path, or null on failure.
+function makeScanDir() {
+  try {
+    return mkdtempSync(joinPath(tmpdir(), "agt-resolve-"));
+  } catch {
+    return null;
+  }
+}
+
+function dirOf(p) {
+  const s = String(p ?? "").replace(/[\\/]+[^\\/]*$/, "");
+  return s || ".";
+}
+
+// Probe whether a resolver (uv/npm) is actually runnable. Mirrors probeScanner.
+async function probeResolver(name, versionArgs) {
+  const r = await spawnCapture(name, versionArgs, { timeoutMs: 10000 });
+  return !r.timedOut && !r.spawnError && (r.code === 0 || /\d+\.\d+/.test(r.stdout) || /\d+\.\d+/.test(r.stderr));
+}
+
+/**
+ * ACTUALLY resolve the transitive dependency set. Runs a real resolver (uv for
+ * Python, npm for Node) into a temp `scanDir` that holds the resolved set under a
+ * scanner-recognized basename, so a downstream scanner sees the FULL transitive
+ * tree. The security contract is in the coverage value (see vocabulary above):
+ *
+ *   - A Python manifest (PEP 723 inline .py / requirements* / pyproject.toml /
+ *     uv.lock) present AND uv runnable AND export succeeds
+ *       → { coverage:"transitive", scanDir, method:"uv", resolved, fromLockfile }
+ *   - Else a package.json present AND npm runnable AND lockfile produced
+ *       → { coverage:"transitive", scanDir, method:"npm", resolved }
+ *   - A pre-existing lockfile we can only PARSE (resolver missing) is the declared
+ *     resolved set without a fresh transitive expansion → "declared-only".
+ *   - No resolver / resolver error / nothing resolvable
+ *       → { coverage:"unavailable" | "declared-only", resolved: declaredSpecs }.
+ *     NEVER "transitive".
+ *
+ * NEVER throws. NEVER returns "transitive" without a resolver-produced scanDir.
+ *
+ * @param {object[]} specs   the DECLARED specs (fallback when resolution fails)
+ * @param {{cwd?:string, manifests?:string[], timeoutMs?:number}} opts
+ * @returns {Promise<{resolved:object[], coverage:'transitive'|'declared-only'|'unavailable',
+ *   scanDir:string|null, method:string|null, fromLockfile:boolean, note?:string}>}
+ */
+export async function resolveTransitive(specs, { cwd = "", manifests = null, timeoutMs = 120000 } = {}) {
+  const declared = Array.isArray(specs) ? specs.slice(0, MAX_SPECS) : [];
+  try {
+    // Resolve Python first (uv), then Node (npm). The first resolver with a usable
+    // manifest AND a runnable tool AND a successful resolve wins.
+    const pyManifest = detectPythonManifest(cwd, manifests);
+    if (pyManifest && await probeResolver("uv", ["--version"])) {
+      const r = await resolveWithUv(pyManifest, { cwd, timeoutMs });
+      if (r.ok) {
+        const resolved = parseManifestFile(joinPath(r.scanDir, "requirements.txt"));
+        return { resolved: resolved.length ? resolved : declared, coverage: "transitive",
+          scanDir: r.scanDir, method: "uv", fromLockfile: true, note: r.note };
+      }
+      // uv present but resolve failed → fall through; a Node manifest may resolve,
+      // otherwise we fail safe below (never claim transitive for the Python set).
+      var pyNote = r.note;
+    }
+
+    const nodeManifest = detectNodeManifest(cwd, manifests);
+    if (nodeManifest && await probeResolver("npm", ["--version"])) {
+      const r = await resolveWithNpm(nodeManifest, { timeoutMs });
+      if (r.ok) {
+        const resolved = parseManifestFile(joinPath(r.scanDir, "package-lock.json"));
+        return { resolved: resolved.length ? resolved : declared, coverage: "transitive",
+          scanDir: r.scanDir, method: "npm", fromLockfile: true, note: r.note };
+      }
+      var nodeNote = r.note;
+    }
+
+    // No resolver produced a transitive tree. If a manifest exists but resolution
+    // could not happen (no tool, or the resolver errored), this is UNAVAILABLE — we
+    // must NOT silently downgrade to a confident "declared-only" clean. The only
+    // "declared-only" case is a PRE-EXISTING lockfile we can parse (the declared set
+    // there IS the resolved tree, just not freshly re-resolved).
+    const haveManifest = !!(pyManifest || nodeManifest);
+    const preLock = findParseableLockfile(cwd, manifests);
+    if (preLock) {
+      const resolved = parseManifestFile(preLock);
+      if (resolved.length) {
+        return { resolved, coverage: "declared-only", scanDir: null, method: "lockfile-parse",
+          fromLockfile: true, note: `Parsed pre-existing ${basename(preLock)}; no resolver available to re-resolve, so coverage is declared-only (the lockfile's set was not freshly scanned in-tree).` };
+      }
+    }
+
+    const note = haveManifest
+      ? `A resolvable manifest was present but transitive resolution could not run (${pyNote || nodeNote || "no resolver (uv/npm) on PATH"}). Coverage is unavailable; the dependency set was NOT verified.`
+      : "No resolvable manifest and no resolver available; coverage unavailable.";
+    return { resolved: declared, coverage: "unavailable", scanDir: null, method: null, fromLockfile: false, note };
+  } catch (e) {
+    // Total: any unexpected failure fails SAFE to unavailable, never transitive.
+    return { resolved: declared, coverage: "unavailable", scanDir: null, method: null, fromLockfile: false,
+      note: `Transitive resolution errored: ${String(e?.message ?? e)}` };
+  }
+}
+
+// Find a pre-existing lockfile we can PARSE (used only for the declared-only
+// fallback when no resolver is available). Returns its path or null.
+function findParseableLockfile(cwd, manifests) {
+  const candidates = Array.isArray(manifests) && manifests.length ? manifests : listManifestCandidates(cwd);
+  for (const lf of ["uv.lock", "poetry.lock", "package-lock.json"]) {
+    for (const p of candidates) {
+      if (basename(p).toLowerCase() === lf && readBoundedSync(p) != null) return p;
+    }
+  }
+  return null;
+}
+
+// Scanner adapters in detection order: each knows how to probe, build args, and
+// parse its JSON into a common rawFindings shape. `buildArgs(scanDir)` scans the
+// directory resolveTransitive populated (it holds the resolver-written
+// requirements.txt / package-lock.json). It may return null to mean "I have no
+// input to scan here" (e.g. pip-audit with no requirements file) — runVulnScanner
+// then degrades to coverage:'unavailable' rather than scanning the wrong thing.
+const SCANNERS = [
+  {
+    name: "trivy",
+    versionArgs: ["--version"],
+    buildArgs: (scanDir) => ["fs", "--scanners", "vuln", "--format", "json", "--quiet", scanDir || "."],
+    parse: parseTrivyJson,
+  },
+  {
+    name: "osv-scanner",
+    versionArgs: ["--version"],
+    buildArgs: (scanDir) => ["--format", "json", "--recursive", scanDir || "."],
+    parse: parseOsvJson,
+  },
+  {
+    name: "pip-audit",
+    versionArgs: ["--version"],
+    // pip-audit with NO target audits the AMBIENT environment (wrong, and often
+    // empty/misleading). Always scan the requirements/constraints files present in
+    // the scan dir via `-r`; if there are none (e.g. a Node lockfile dir), return
+    // null so the scan is reported unavailable instead of auditing the host.
+    buildArgs: (scanDir) => {
+      const reqs = findRequirementsFiles(scanDir);
+      if (reqs.length === 0) return null;
+      const args = ["--format", "json", "--progress-spinner", "off"];
+      for (const f of reqs) { args.push("-r", f); }
+      return args;
+    },
+    parse: parsePipAuditJson,
+  },
+];
+
+// List requirements/constraints files in a directory (non-recursive, bounded).
+// Returns paths suitable for `pip-audit -r`. Never throws.
+function findRequirementsFiles(dir) {
+  if (!dir) return [];
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of entries) {
     if (out.length >= 64) break;
-    if (isRequirementsTxtName(String(name).toLowerCase())) out.push(joinPath(cwd, name));
+    if (isRequirementsTxtName(String(name).toLowerCase())) out.push(joinPath(dir, name));
   }
   return out;
 }
 
 /**
- * Auto-detect an installed scanner (trivy → osv-scanner → pip-audit), run it,
- * and parse its output. NEVER throws — on no scanner / timeout / parse failure
- * returns { available:false, findings:[], note }.
- * @returns {Promise<{available:boolean, scanner?:string, findings:object[], note?:string}>}
+ * Auto-detect an installed scanner (trivy → osv-scanner → pip-audit), run it over
+ * the `scanDir` that resolveTransitive produced, and parse its output. NEVER throws.
+ *
+ * Coverage is threaded HONESTLY from resolution: the scan can only ever be as good
+ * as what was resolved. `coverage` (from resolveTransitive — "transitive" or
+ * "declared-only") is the CEILING; any failure to actually scan (no scanner,
+ * timeout, unparseable output, no scannable input, missing scanDir) drops it to
+ * "unavailable". We NEVER report "transitive" for a set a scanner did not scan.
+ *
+ * @param {object[]} resolvedSpecs  the resolved set (for the caller's record only)
+ * @param {{scanDir?:string|null, coverage?:string, scannerCmd?:string|null,
+ *   timeoutMs?:number, cwd?:string}} opts
+ *   - scanDir: the resolver-populated dir to scan. If absent, falls back to cwd
+ *     (legacy behavior) but coverage is forced to "unavailable" unless a real
+ *     resolved scanDir was supplied — a bare cwd scan is not a transitive guarantee.
+ *   - coverage: the resolution coverage ceiling ("transitive"|"declared-only").
+ * @returns {Promise<{available:boolean, scanner?:string, coverage:string,
+ *   dbVersion:string|null, findings:object[], note?:string}>}
  */
-export async function runVulnScanner(resolvedSpecs, { cwd = "", scannerCmd = null, timeoutMs = 120000, fromLockfile = null } = {}) {
+export async function runVulnScanner(resolvedSpecs, { scanDir = null, coverage = null, cwd = "", scannerCmd = null, timeoutMs = 120000 } = {}) {
+  // The directory we hand the scanner. A resolver-produced scanDir is authoritative;
+  // a bare cwd (legacy callers) can be scanned but can NEVER be claimed transitive.
+  const target = scanDir || cwd || "";
+  // The honest ceiling: only a real resolver scanDir may carry a "transitive"/
+  // "declared-only" ceiling; anything else is capped at "unavailable".
+  const ceiling = scanDir
+    ? (coverage === "transitive" || coverage === "declared-only" ? coverage : "declared-only")
+    : "unavailable";
+
   let chosen = null;
   if (scannerCmd) {
     chosen = SCANNERS.find((s) => s.name === scannerCmd) || null;
@@ -804,18 +1113,18 @@ export async function runVulnScanner(resolvedSpecs, { cwd = "", scannerCmd = nul
       note: "No supported vulnerability scanner found on PATH (looked for trivy, osv-scanner, pip-audit)." };
   }
 
-  const args = chosen.buildArgs(cwd);
+  const args = chosen.buildArgs(target);
   if (args == null) {
-    // The scanner has nothing to scan here (e.g. pip-audit with no requirements
-    // file) — report unavailable rather than scanning the wrong target.
+    // The scanner has nothing to scan here (e.g. pip-audit pointed at a Node
+    // lockfile dir) — report unavailable rather than scanning the wrong target.
     return { available: false, scanner: chosen.name, coverage: "unavailable", dbVersion: null, findings: [],
-      note: `${chosen.name} has no scannable input in this directory (no requirements/constraints file for pip-audit); skipping rather than auditing the ambient environment.` };
+      note: `${chosen.name} has no scannable input in the resolved dir; skipping rather than auditing the wrong target (coverage unavailable).` };
   }
 
-  const run = await spawnCapture(chosen.name, args, { cwd, timeoutMs });
+  const run = await spawnCapture(chosen.name, args, { cwd: target, timeoutMs });
   if (run.timedOut) {
     return { available: false, scanner: chosen.name, coverage: "unavailable", dbVersion: null, findings: [],
-      note: `${chosen.name} timed out after ${timeoutMs} ms.` };
+      note: `${chosen.name} timed out after ${timeoutMs} ms (coverage unavailable).` };
   }
   // Many scanners exit non-zero precisely BECAUSE they found vulns, so we parse
   // stdout regardless of exit code; only a parse failure degrades to unavailable.
@@ -827,15 +1136,66 @@ export async function runVulnScanner(resolvedSpecs, { cwd = "", scannerCmd = nul
   }
   if (findings == null) {
     return { available: false, scanner: chosen.name, coverage: "unavailable", dbVersion: null, findings: [],
-      note: `${chosen.name} produced output that could not be parsed as JSON findings.` };
+      note: `${chosen.name} produced output that could not be parsed as JSON findings (coverage unavailable).` };
   }
-  // Coverage: a tool that resolves a lockfile/project tree covers the FULL resolved
-  // set; one that reads only the declared set (pip-audit -r) is "declared-only". If
-  // the caller told us a lockfile drove resolution, prefer that signal.
-  const lockKnown = typeof fromLockfile === "boolean";
-  const coverage = (lockKnown ? fromLockfile : chosen.scansLockfile) ? "full" : "declared-only";
+  // The scan ran and parsed: coverage is the resolution ceiling (a real resolved
+  // scanDir → "transitive"/"declared-only"; a bare cwd → "unavailable").
   const db = await scannerDbVersion(chosen.name);
-  return { available: true, scanner: chosen.name, coverage, dbVersion: db ? db.version : null, findings };
+  return { available: true, scanner: chosen.name, coverage: ceiling, dbVersion: db ? db.version : null, findings };
+}
+
+/**
+ * The clean entry point the proactive audit calls: resolve the transitive set and
+ * scan it in one step, returning an honest coverage verdict. NEVER throws.
+ *
+ * Coverage is the SECURITY CONTRACT:
+ *   - "transitive"    → resolver produced the full tree AND a scanner scanned it.
+ *                       Only this, with zero findings, may be a clean silent-allow.
+ *   - "declared-only" → only the declared set was scanned (pre-existing lockfile we
+ *                       could parse, no fresh resolve). Not silent-allow.
+ *   - "unavailable"   → no resolver / no scanner / resolver or scanner error /
+ *                       timeout / nothing resolvable. Treated as UNVERIFIED=UNSAFE;
+ *                       a zero-findings "unavailable" is NEVER clean.
+ *
+ * @param {{cwd?:string, manifests?:string[], specs?:object[], scannerCmd?:string|null,
+ *   timeoutMs?:number}} opts
+ * @returns {Promise<{available:boolean, scanner:string|null, findings:object[],
+ *   coverage:string, dbVersion:string|null, method:string|null, note:string}>}
+ */
+export async function resolveAndScan({ cwd = "", manifests = null, specs = null, scannerCmd = null, timeoutMs = 120000 } = {}) {
+  try {
+    const res = await resolveTransitive(specs ?? [], { cwd, manifests, timeoutMs });
+    // Resolution itself failed to produce a transitive tree. If we have a declared-
+    // only lockfile we CAN still scan it (declared-only); otherwise unavailable.
+    if (res.coverage === "unavailable" && !res.scanDir) {
+      return { available: false, scanner: null, findings: [], coverage: "unavailable",
+        dbVersion: null, method: res.method ?? null, note: res.note ?? "Transitive resolution unavailable." };
+    }
+    // "declared-only" with no scanDir means we only parsed a pre-existing lockfile
+    // and have no in-tree dir to hand a scanner — we cannot freshly scan it here, so
+    // it stays declared-only with no scanner findings claimed (NOT a clean stamp).
+    if (!res.scanDir) {
+      return { available: false, scanner: null, findings: [], coverage: res.coverage,
+        dbVersion: null, method: res.method ?? null,
+        note: res.note ?? "No in-tree scan dir; declared-only without a fresh scan." };
+    }
+    const scan = await runVulnScanner(res.resolved, {
+      scanDir: res.scanDir, coverage: res.coverage, scannerCmd, timeoutMs,
+    });
+    return {
+      available: scan.available,
+      scanner: scan.scanner ?? null,
+      findings: Array.isArray(scan.findings) ? scan.findings : [],
+      coverage: scan.coverage,
+      dbVersion: scan.dbVersion ?? null,
+      method: res.method ?? null,
+      note: scan.available ? (res.note ?? "") : (scan.note ?? res.note ?? ""),
+    };
+  } catch (e) {
+    // Total fail-safe.
+    return { available: false, scanner: null, findings: [], coverage: "unavailable",
+      dbVersion: null, method: null, note: `resolveAndScan errored: ${String(e?.message ?? e)}` };
+  }
 }
 
 /** Best-effort scanner vuln-DB version string, or null. Never throws. */
@@ -863,12 +1223,27 @@ async function probeScanner(name, versionArgs) {
 
 // Spawn a process, capture stdout/stderr, enforce a timeout. NEVER throws —
 // returns { code, stdout, stderr, timedOut, spawnError }. Used only by Tier-2.
-async function spawnCapture(cmd, args, { cwd = "", timeoutMs = 120000 } = {}) {
+async function spawnCapture(cmd, args, { cwd = "", timeoutMs = 120000, env = null } = {}) {
   const { spawn } = await import("node:child_process");
+  // On Windows the resolvers/scanners on PATH are frequently .cmd shims (npm) or
+  // bare names; spawning them with shell:false fails (ENOENT for `npm`, EINVAL for
+  // `npm.cmd` since Node's CVE-2024-27980 fix blocks .cmd/.bat without a shell). We
+  // do NOT use shell:true (it would not quote args and invites injection from a
+  // manifest path). Instead route every command through `cmd.exe /d /s /c CMD ...`:
+  // Node still quotes each arg individually (windowsVerbatimArguments is false), so
+  // a path with spaces or metacharacters is passed literally, and both .exe tools
+  // (uv/trivy/osv-scanner) and .cmd shims (npm) resolve uniformly.
+  let runCmd = cmd;
+  let runArgs = args;
+  if (process.platform === "win32") {
+    const comspec = process.env.ComSpec || process.env.COMSPEC || "cmd.exe";
+    runCmd = comspec;
+    runArgs = ["/d", "/s", "/c", cmd, ...args];
+  }
   return await new Promise((resolve) => {
     let child;
     try {
-      child = spawn(cmd, args, { cwd: cwd || undefined, shell: false, windowsHide: true });
+      child = spawn(runCmd, runArgs, { cwd: cwd || undefined, shell: false, windowsHide: true, env: env || undefined });
     } catch (e) {
       resolve({ code: -1, stdout: "", stderr: String(e?.message ?? e), timedOut: false, spawnError: true });
       return;
@@ -1074,7 +1449,16 @@ function mapSeverity(s) {
  * the raw scan result with `attestationError` if attestation.mjs is unavailable.
  */
 export async function attestDepsScan(resolvedSpecs, opts = {}) {
-  const scan = await runVulnScanner(resolvedSpecs, opts);
+  // Resolve + scan via the honest one-step entry so the attestation carries the
+  // REAL coverage (transitive / declared-only / unavailable) rather than assuming
+  // a bare scan covered the transitive tree.
+  const scan = await resolveAndScan({
+    cwd: opts.cwd ?? "",
+    manifests: opts.manifests ?? null,
+    specs: Array.isArray(resolvedSpecs) ? resolvedSpecs : (opts.specs ?? null),
+    scannerCmd: opts.scannerCmd ?? null,
+    timeoutMs: opts.timeoutMs ?? 120000,
+  });
   try {
     const att = await import("./attestation.mjs");
     // attestation.decideFromFindings expects a RECORD ({rawFindings, basis,
@@ -1088,7 +1472,9 @@ export async function attestDepsScan(resolvedSpecs, opts = {}) {
       // the set is carried by scanCoverage, which decideFromFindings inspects so an
       // unavailable/partial scan with zero findings is reviewed, not silent-allowed.
       basis: "scanned",
-      scanCoverage: scan.coverage ?? (scan.available ? "full" : "unavailable"),
+      // Coverage vocabulary is transitive | declared-only | unavailable. Never
+      // synthesize a clean "full" — an absent coverage means we did NOT verify.
+      scanCoverage: scan.coverage ?? "unavailable",
       scanner: scan.scanner ?? null,
       dbVersion: scan.dbVersion ?? null,
     };
