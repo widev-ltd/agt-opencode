@@ -1,0 +1,208 @@
+{
+  "measured": "deterministic supply-chain gate (enforce)",
+  "overall": {
+    "coverage_pct": 83.52,
+    "prevention_pct": 83.52,
+    "svr_pct": 16.48,
+    "fpr_pct": 0,
+    "friction_pct": 5.36,
+    "attacks_in_scope": 91,
+    "covered_named": 76,
+    "prevented_any": 76,
+    "benign_total": 56,
+    "benign_denied": 0,
+    "benign_asked": 3
+  },
+  "per_category": {
+    "benign": {
+      "coverage_pct": null,
+      "prevention_pct": null,
+      "svr_pct": null,
+      "fpr_pct": 0,
+      "friction_pct": 5.36,
+      "attacks_in_scope": 0,
+      "covered_named": 0,
+      "prevented_any": 0,
+      "benign_total": 56,
+      "benign_denied": 0,
+      "benign_asked": 3
+    },
+    "calibration-gap": {
+      "coverage_pct": 0,
+      "prevention_pct": 0,
+      "svr_pct": 100,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 12,
+      "covered_named": 0,
+      "prevented_any": 0,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-denied": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 7,
+      "covered_named": 7,
+      "prevented_any": 7,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-install-script": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 5,
+      "covered_named": 5,
+      "prevented_any": 5,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-non-registry": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 8,
+      "covered_named": 8,
+      "prevented_any": 8,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-npm-alias": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 3,
+      "covered_named": 3,
+      "prevented_any": 3,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-typosquat": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 12,
+      "covered_named": 12,
+      "prevented_any": 12,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-unpinned": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 5,
+      "covered_named": 5,
+      "prevented_any": 5,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "dep-untrusted-index": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 7,
+      "covered_named": 7,
+      "prevented_any": 7,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "skill-capability": {
+      "coverage_pct": 50,
+      "prevention_pct": 50,
+      "svr_pct": 50,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 6,
+      "covered_named": 3,
+      "prevented_any": 3,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "skill-dangerous": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 12,
+      "covered_named": 12,
+      "prevented_any": 12,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "skill-injection": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 7,
+      "covered_named": 7,
+      "prevented_any": 7,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    },
+    "skill-secret": {
+      "coverage_pct": 100,
+      "prevention_pct": 100,
+      "svr_pct": 0,
+      "fpr_pct": null,
+      "friction_pct": null,
+      "attacks_in_scope": 7,
+      "covered_named": 7,
+      "prevented_any": 7,
+      "benign_total": 0,
+      "benign_denied": 0,
+      "benign_asked": 0
+    }
+  },
+  "expected_match_rate_pct": 100,
+  "expected_match": {
+    "matched": 147,
+    "total": 147
+  },
+  "cases": 147,
+  "policy": {
+    "mode": "enforce",
+    "severityThreshold": "medium",
+    "requirePinned": true,
+    "deny": [
+      "evil-pkg",
+      "evilpkg",
+      "flatmap-stream",
+      "@scope/evil-pkg"
+    ],
+    "deniedLicenses": [
+      "agpl"
+    ]
+  },
+  "note": "Deterministic supply-chain track: scanSkill + Tier-1 deps (scanDependencyMetadata over manifest-file specs) in enforce mode. No vuln scanner, no network. A deployed enforce gate adds review-until-vuln-scanned friction NOT measured here (see README)."
+}

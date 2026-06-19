@@ -1,0 +1,6 @@
+{
+  "name": "clean-npm-pinned-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "chalk": "5.3.0", "ms": "2.1.3" }
+}

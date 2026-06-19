@@ -1,0 +1,12 @@
+{
+  "algorithm": "sha256",
+  "combined": "f1aa9b97f0d8dfc72280ac276adde53c3546c43296e19385058e4434836a8bd8",
+  "files": {
+    "corpus/cases/benign.jsonl": "4f09cda9f7b8d19e89062d97fd553e4bc240ac611cc79ef65deb318fda6e4629",
+    "corpus/cases/calibration-gaps.jsonl": "1ae5bb7589fc9534be5525be3cd9532227ea36db16256f151d77787c0c2d2647",
+    "corpus/cases/dep-threats.jsonl": "00fa385be1302a0ec6affd73ecc9f788644f67e1e1b21cccda9697c871eb3b6f",
+    "corpus/cases/skill-threats.jsonl": "af7e281211136751c5796cc33443f17fcd3e2ee348e5ba3824346d07bb3ddf13",
+    "corpus/schema-sc.json": "43b147723f90e677be899426d2ccf8396d8664b359e239aff10023449a03e2f3",
+    "results-sc/matrix-sc.csv": "500201e6ed29c8e28912604536b9b64f99726f1e5766f3cbf45415f972df7419"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "npm-minimist-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "minimist": "1.2.0" }
+}

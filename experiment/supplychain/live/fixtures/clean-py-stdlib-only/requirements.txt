@@ -1,0 +1,2 @@
+# Standard-library-only project: no third-party dependencies declared.
+# A correct scanner must report ZERO findings here (true-negative / empty input).

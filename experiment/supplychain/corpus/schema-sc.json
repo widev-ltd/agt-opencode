@@ -1,0 +1,127 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://widev.ltd/agt/experiment/supplychain/corpus/schema-sc.json",
+  "title": "AGT supply-chain governance benchmark — deterministic case schema",
+  "description": "One JSON object per line in cases/*.jsonl. A case materializes fixture.files into a temp .../skills/<name>/ dir, optionally runs fixture.invoke, and the scorer runs the deterministic supply-chain detectors (deps.mjs scanDependencyMetadata + skills.mjs scanSkill) in enforce mode and compares the gate decision against expected.outcome. All cases here are deterministic (pure, offline) — the live CVE track is built separately. expected.detector/outcome are PRE-REGISTERED by static reasoning over the documented detectors BEFORE any run; rationale is the auditable core a skeptic checks. A KNOWN-GAP threat (expected_blocked:true, expected.outcome:'allow', detector:'') documents an honest coverage miss.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "category",
+    "track",
+    "source",
+    "severity",
+    "expected_blocked",
+    "fixture",
+    "expected",
+    "rationale"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^sc-[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "description": "Globally unique, stable, kebab-case, prefixed 'sc-<category-stem>-NN'."
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "dep-typosquat",
+        "dep-unpinned",
+        "dep-denied",
+        "dep-non-registry",
+        "dep-install-script",
+        "dep-untrusted-index",
+        "dep-license",
+        "dep-npm-alias",
+        "skill-dangerous",
+        "skill-secret",
+        "skill-injection",
+        "skill-capability",
+        "benign",
+        "calibration-gap"
+      ],
+      "description": "Threat taxonomy bucket. DEP threats carry a manifest fixture; SKILL threats carry SKILL.md + scripts; benign is the load-bearing FPR corpus; calibration-gap is a real threat the current detectors KNOWN to miss."
+    },
+    "track": {
+      "type": "string",
+      "enum": ["deterministic"],
+      "description": "All cases in this corpus are deterministic (pure, offline Tier-1 metadata + skill static scan). The live CVE/Tier-2 scanner track is authored separately."
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "license"],
+      "properties": {
+        "origin": { "type": "string", "enum": ["authored"] },
+        "license": { "type": "string", "enum": ["WiDev-internal"] }
+      }
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "expected_blocked": {
+      "type": "boolean",
+      "description": "Ground truth: true = a real supply-chain threat a correct gate SHOULD catch; false = benign that must NOT be denied. A KNOWN-GAP threat stays expected_blocked:true even though expected.outcome is 'allow'."
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files"],
+      "properties": {
+        "files": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "minProperties": 1,
+          "description": "Map of relpath -> file content (string). Materialized into a temp .../skills/<name>/ dir. DEP cases include requirements.txt / pyproject.toml / package.json; SKILL cases include SKILL.md and/or scripts/manifests."
+        },
+        "invoke": {
+          "type": "string",
+          "description": "OPTIONAL command the runtime gate sees (checkSkillInvocationMeta). Relative paths are resolved against the skill dir. Omit to let the scorer default to the first script."
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "OPTIONAL per-case policy override the scorer merges over the default supply-chain policy before scoring this case. Used where a detector is OPT-IN under the default (e.g. the capability profile is permissive by default, so a capability THREAT needs a restrictive budget to fire). Shape mirrors the plugin policy: { depsPolicies?: {...}, skillPolicies?: { capabilityProfile?: { maxNetwork, maxFsWrite, maxSubprocess, maxSecretRead } } }. Omit to use the scorer's default policy."
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detector", "outcome"],
+      "properties": {
+        "detector": {
+          "type": "string",
+          "enum": [
+            "",
+            "typosquat",
+            "unpinned",
+            "denied-package",
+            "non-registry-source",
+            "install-script",
+            "untrusted-index",
+            "denied-license",
+            "analysis-truncated",
+            "dangerous-pattern",
+            "secret",
+            "injection",
+            "capability",
+            "symlink"
+          ],
+          "description": "For threats: the named finding kind expected. '' for benign AND for KNOWN-GAP threats (the detector misses it)."
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["deny", "review", "allow"],
+          "description": "Pre-registered enforce-mode gate decision. high/critical finding -> deny; medium -> review; benign -> allow. A KNOWN-GAP threat the detector misses -> allow."
+        }
+      }
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 20,
+      "description": "WHY the expected outcome holds, by STATIC reasoning — cite the exact pattern/heuristic the payload hits (threats) or evades (benign near-miss / calibration gap)."
+    }
+  }
+}

@@ -1,0 +1,172 @@
+{
+  "_comment": "LIVE supply-chain CVE-detection fixtures. Each entry points at a fixture directory containing a real dependency manifest (requirements.txt or package.json+package-lock.json). 'class' is 'vulnerable' (we EXPECT the scanner to flag >=1 high/critical) or 'clean' (true-negative: we EXPECT 0 high/critical). 'expect' documents WHY a fixture is vulnerable with representative CVEs/advisories that were KNOWN-PRESENT for that package@version at authoring time (2026-06-19); the exact advisory IDs and counts are a moving target as scanner DBs update, which is why this track is NOT byte-sealed. The scoring contract is severity-band-level (>=1 high/critical for vulnerable, 0 high/critical for clean), NOT an exact-CVE-id match.",
+  "authoredDate": "2026-06-19",
+  "fixtures": [
+    {
+      "id": "py-jinja2-2.10",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-jinja2-2.10",
+      "manifest": "requirements.txt",
+      "packages": ["jinja2==2.10"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2019-10906", "CVE-2020-28493", "CVE-2024-22195"],
+        "note": "Jinja2 2.10 predates fixes for sandbox escape (CVE-2019-10906, HIGH) and later XSS/ReDoS issues."
+      }
+    },
+    {
+      "id": "py-pyyaml-5.1",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-pyyaml-5.1",
+      "manifest": "requirements.txt",
+      "packages": ["PyYAML==5.1"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2020-1747", "CVE-2020-14343"],
+        "note": "PyYAML 5.1 full_load/load arbitrary code execution via crafted YAML (CRITICAL)."
+      }
+    },
+    {
+      "id": "py-requests-2.19.1",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-requests-2.19.1",
+      "manifest": "requirements.txt",
+      "packages": ["requests==2.19.1"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2018-18074", "CVE-2023-32681"],
+        "note": "requests 2.19.1: credential leak on redirect (CVE-2018-18074); Proxy-Authorization leak (CVE-2023-32681)."
+      }
+    },
+    {
+      "id": "py-urllib3-1.24.1",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-urllib3-1.24.1",
+      "manifest": "requirements.txt",
+      "packages": ["urllib3==1.24.1"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2019-11324", "CVE-2021-33503", "CVE-2020-26137"],
+        "note": "urllib3 1.24.1: CRLF injection, ReDoS (CVE-2021-33503, HIGH), cert-handling issues."
+      }
+    },
+    {
+      "id": "py-flask-0.12",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-flask-0.12",
+      "manifest": "requirements.txt",
+      "packages": ["Flask==0.12"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2018-1000656", "CVE-2019-1010083"],
+        "note": "Flask 0.12: DoS via crafted JSON / Werkzeug-related issues; transitively pulls vulnerable deps."
+      }
+    },
+    {
+      "id": "py-mixed-vuln",
+      "ecosystem": "pypi",
+      "class": "vulnerable",
+      "dir": "py-mixed-vuln",
+      "manifest": "requirements.txt",
+      "packages": ["jinja2==2.10", "PyYAML==5.1", "requests==2.19.1", "urllib3==1.24.1", "Flask==0.12"],
+      "expect": {
+        "minHighCritical": 3,
+        "representativeCves": ["CVE-2020-1747", "CVE-2019-10906", "CVE-2021-33503"],
+        "note": "Five known-vulnerable packages in one manifest; a working scanner must flag several high/critical."
+      }
+    },
+    {
+      "id": "npm-lodash-4.17.4",
+      "ecosystem": "npm",
+      "class": "vulnerable",
+      "dir": "npm-lodash-4.17.4",
+      "manifest": "package-lock.json",
+      "packages": ["lodash@4.17.4"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2019-10744", "CVE-2020-8203", "CVE-2021-23337"],
+        "note": "lodash 4.17.4: prototype pollution (CVE-2019-10744, CRITICAL), command injection in template (CVE-2021-23337, HIGH)."
+      }
+    },
+    {
+      "id": "npm-minimist-1.2.0",
+      "ecosystem": "npm",
+      "class": "vulnerable",
+      "dir": "npm-minimist-1.2.0",
+      "manifest": "package-lock.json",
+      "packages": ["minimist@1.2.0"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2020-7598", "CVE-2021-44906"],
+        "note": "minimist 1.2.0: prototype pollution (CVE-2021-44906 rated CRITICAL by several DBs)."
+      }
+    },
+    {
+      "id": "npm-node-fetch-2.6.0",
+      "ecosystem": "npm",
+      "class": "vulnerable",
+      "dir": "npm-node-fetch-2.6.0",
+      "manifest": "package-lock.json",
+      "packages": ["node-fetch@2.6.0"],
+      "expect": {
+        "minHighCritical": 1,
+        "representativeCves": ["CVE-2022-0235", "CVE-2020-15168"],
+        "note": "node-fetch 2.6.0: exposure of sensitive info to untrusted host on redirect (CVE-2022-0235, HIGH); size-limit bypass DoS."
+      }
+    },
+    {
+      "id": "npm-mixed-vuln",
+      "ecosystem": "npm",
+      "class": "vulnerable",
+      "dir": "npm-mixed-vuln",
+      "manifest": "package-lock.json",
+      "packages": ["lodash@4.17.4", "minimist@1.2.0", "node-fetch@2.6.0"],
+      "expect": {
+        "minHighCritical": 2,
+        "representativeCves": ["CVE-2019-10744", "CVE-2021-44906", "CVE-2022-0235"],
+        "note": "Three known-vulnerable npm packages in one lockfile."
+      }
+    },
+    {
+      "id": "clean-py-pinned",
+      "ecosystem": "pypi",
+      "class": "clean",
+      "dir": "clean-py-pinned",
+      "manifest": "requirements.txt",
+      "packages": ["jinja2==3.1.6", "requests==2.32.3", "certifi==2024.8.30"],
+      "expect": {
+        "maxHighCritical": 0,
+        "note": "Recent pinned versions with no KNOWN high/critical advisories at authoring time (2026-06-19). Medium/low findings may exist and are acceptable; the true-negative contract is 0 high/critical. If a future advisory raises one of these to high, this fixture must be re-pinned (see README determinism caveat)."
+      }
+    },
+    {
+      "id": "clean-npm-pinned",
+      "ecosystem": "npm",
+      "class": "clean",
+      "dir": "clean-npm-pinned",
+      "manifest": "package-lock.json",
+      "packages": ["chalk@5.3.0", "ms@2.1.3"],
+      "expect": {
+        "maxHighCritical": 0,
+        "note": "chalk 5.3.0 + ms 2.1.3 had zero KNOWN advisories of any severity at authoring time. True-negative contract: 0 high/critical."
+      }
+    },
+    {
+      "id": "clean-py-stdlib-only",
+      "ecosystem": "pypi",
+      "class": "clean",
+      "dir": "clean-py-stdlib-only",
+      "manifest": "requirements.txt",
+      "packages": [],
+      "expect": {
+        "maxHighCritical": 0,
+        "note": "Comment-only requirements.txt: no third-party deps. Exercises the empty-input path; a correct scanner reports zero findings."
+      }
+    }
+  ]
+}
