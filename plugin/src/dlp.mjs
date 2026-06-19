@@ -255,7 +255,22 @@ export function scanForDlp(text, dlp) {
       if (pattern.validate && !pattern.validate(value)) {
         continue;
       }
-      const context = text.slice(Math.max(0, m.index - 100), m.index + value.length + 100);
+      // Suppress only when an allow-marker (EXAMPLE / PLACEHOLDER / xxxx / **** /
+      // redacted) is part of the SAME whitespace-delimited token as the matched
+      // value — NOT merely somewhere in a ±100-char neighborhood. The old wide
+      // window let an unrelated nearby word ("evil.example", an "xxxx" elsewhere,
+      // a "****" mask on a different line) cloak a real adjacent secret
+      // (A-SKILLGOV recheck FN). Canonical placeholders embed the marker in the
+      // value itself (AKIAIOSFODNN7EXAMPLE) or fuse it to the value (****1234****),
+      // so a bounded same-token window preserves the intended suppression.
+      const EDGE = 64; // bound the expansion so a giant unbroken token can't blow up the scan
+      let s = m.index;
+      const sMin = Math.max(0, m.index - EDGE);
+      while (s > sMin && !/\s/.test(text[s - 1])) s--;
+      let e = m.index + value.length;
+      const eMax = Math.min(text.length, e + EDGE);
+      while (e < eMax && !/\s/.test(text[e])) e++;
+      const context = text.slice(s, e);
       if (dlp.allowPatterns.some((allow) => allow.test(context))) {
         continue;
       }

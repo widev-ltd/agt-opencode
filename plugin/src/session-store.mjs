@@ -352,6 +352,18 @@ export function readSessionItems(namespace, sessionId) {
  * Best-effort age-based eviction of a namespace's session files (disk backend).
  * Also enforces a hard file-count cap (oldest-by-mtime evicted first). No-op on
  * the memory backend (the resident host caps its own collections).
+ *
+ * AGE COMPARISON is `>=` ("older-or-equal than maxAge ⇒ evict") over a
+ * NON-NEGATIVE age (`Math.max(0, now - mtime)`): with maxAgeMs=0 EVERYTHING is
+ * evicted, deterministically. Two Windows races motivated this:
+ *   1. A strict `>` never evicts at maxAge=0 even for a normal positive age.
+ *   2. A just-written file's high-resolution mtimeMs (sub-millisecond fraction)
+ *      can read as fractionally NEWER than the integer-truncated `now` captured
+ *      at the top of this function, making `now - mtime` slightly NEGATIVE. A
+ *      raw `>= maxAgeMs(0)` would then be `(-0.4 >= 0)` → false and skip the
+ *      eviction ~a few % of the time. Clamping the age to >= 0 means a file is
+ *      never treated as "from the future"; at maxAge=0 the age is exactly 0 and
+ *      is evicted every time. For any real (positive) age the clamp is a no-op.
  */
 export function cleanupSessions(namespace, maxAgeMs = 24 * 3600 * 1000, maxFiles = 5000) {
   if (!useDisk()) {
@@ -380,7 +392,11 @@ export function cleanupSessions(namespace, maxAgeMs = 24 * 3600 * 1000, maxFiles
     const p = join(dir, ent.name);
     try {
       const st = statSync(p);
-      if (now - st.mtimeMs > maxAgeMs) {
+      // Clamp the age to >= 0 so a sub-millisecond "future" mtime (NTFS high-res
+      // mtime vs integer-truncated `now`) cannot flip the comparison negative and
+      // skip a maxAge=0 eviction. For any real positive age this is a no-op.
+      const ageMs = Math.max(0, now - st.mtimeMs);
+      if (ageMs >= maxAgeMs) {
         remove(p, isDir);
       } else {
         stats.push({ p, mtime: st.mtimeMs, isDir });

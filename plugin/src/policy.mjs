@@ -23,7 +23,37 @@ import { compileDlpPolicy, scanForDlp, dlpDecision } from "./dlp.mjs";
 import { compileRateLimitPolicy, checkRateLimit } from "./rate-limit.mjs";
 import { compileExfilPolicy, trackSecretsFromOutput, checkForExfil } from "./exfil.mjs";
 import { compileContentSafetyPolicy, scanContentSafety } from "./content-safety.mjs";
-import { withFileLock, writeFileAtomicSync } from "./session-store.mjs";
+import { compileDepsPolicy, parseManifests, scanDependencyMetadata, depsDecision } from "./deps.mjs";
+import { compileSkillPolicy, checkSkillInvocationMeta, skillFileHashesSync } from "./skills.mjs";
+import * as _skills from "./skills.mjs"; // optional helpers (e.g. skillHasUnhashableEntries) accessed defensively
+import {
+  skillIntegrityKey,
+  readAttestation,
+  writeAttestation,
+  isFresh,
+  decideFromFindings,
+  DEFAULT_MAX_AGE_MS,
+} from "./attestation.mjs";
+import { withFileLock, writeFileAtomicSync, dataDir } from "./session-store.mjs";
+
+// Runtime-readable cache of the vulnerability scanner's DB version, written by
+// the PROACTIVE audit (skills-audit.mjs / the OC `skills audit` CLI) after a
+// scan. The runtime gate reads it to enforce the attestation DB-version binding
+// WITHOUT spawning the scanner (the hot path must stay scanner-free). Absent →
+// the binding is skipped and freshness falls back to age-only.
+const SCANNER_DB_VERSION_FILE = "scanner-db-version.json";
+
+function readCachedScannerDbVersion() {
+  try {
+    const p = join(dataDir(), SCANNER_DB_VERSION_FILE);
+    if (!existsSync(p)) return undefined;
+    const v = JSON.parse(readFileSync(p, "utf-8"));
+    const ver = v && typeof v.version === "string" ? v.version : undefined;
+    return ver && ver.length ? ver : undefined;
+  } catch {
+    return undefined; // never throw into the decision path
+  }
+}
 
 export const USER_POLICY_ENV = "AGT_COPILOT_POLICY_PATH";
 export const AUDIT_PATH_ENV = "AGT_COPILOT_AUDIT_PATH";
@@ -205,6 +235,8 @@ export function compilePolicy(raw) {
     rateLimit: compileRateLimitPolicy(raw?.rateLimitPolicies ?? null),
     exfil: compileExfilPolicy(raw?.exfilPolicies ?? null),
     contentSafety: compileContentSafetyPolicy(raw?.contentSafetyPolicies ?? null),
+    deps: compileDepsPolicy(raw?.dependencyPolicies ?? null),
+    skill: compileSkillPolicy(raw?.skillPolicies ?? null),
   };
 }
 
@@ -381,6 +413,12 @@ export function mergeMonotonic(base, project) {
   const rateLimit = mergeExtensionMonotonic(base.rateLimit, project.rateLimit, clamp);
   const exfil = mergeExtensionMonotonic(base.exfil, project.exfil, clamp);
   const contentSafety = mergeExtensionMonotonic(base.contentSafety, project.contentSafety, clamp);
+  // Supply-chain layers follow the same monotonic rule: a project may ENABLE or
+  // tighten the mode, never disable or relax the body (mergeExtensionMonotonic
+  // keeps the base body verbatim — the dlp/exfil-specific relaxation checks
+  // inside simply no-op for these shapes).
+  const deps = mergeExtensionMonotonic(base.deps, project.deps, clamp);
+  const skill = mergeExtensionMonotonic(base.skill, project.skill, clamp);
 
   const merged = {
     additionalContext,
@@ -401,6 +439,8 @@ export function mergeMonotonic(base, project) {
     rateLimit,
     exfil,
     contentSafety,
+    deps,
+    skill,
   };
   return { policy: merged, clamped };
 }
@@ -509,6 +549,38 @@ export async function evaluatePreToolUse(state, input, invocation = {}) {
       }
     }
 
+    // Supply-chain gate: dependency hygiene (Tier-1) + skill attestation lookup.
+    // SYNC, additive-only, scoped to real skill/dep invocations (the corpus has
+    // none, so this no-ops on every benchmark case and the seal is unaffected).
+    // It NEVER downgrades the base decision: it may add notes, raise to review,
+    // or (enforce only) hard-deny — all strictness-increasing.
+    if (state.policy.deps || state.policy.skill) {
+      let sc;
+      try {
+        sc = checkSkillDeps(state, {
+          command: extractCommandText(input?.toolArgs),
+          cwd: input?.cwd,
+          sessionId: invocation.sessionId,
+        });
+      } catch {
+        sc = null; // a supply-chain check failure must never throw into the decision
+      }
+      if (sc) {
+        for (const event of sc.audit ?? []) {
+          await recordAudit(state, { action: event.action, decision: event.decision, sessionId: invocation.sessionId });
+        }
+        if (sc.deny) {
+          return { permissionDecision: "deny", permissionDecisionReason: sc.deny };
+        }
+        if (sc.raiseToReview) {
+          raiseToReview = true;
+        }
+        if (Array.isArray(sc.notes)) {
+          for (const n of sc.notes) notes.push(n);
+        }
+      }
+    }
+
     const extra = notes.length ? `\n${notes.join("\n")}` : "";
 
     if (decision.effectiveDecision === "deny") {
@@ -550,6 +622,201 @@ export async function evaluatePreToolUse(state, input, invocation = {}) {
   }
 
   return undefined;
+}
+
+// ── Supply-chain runtime gate (sync, additive-only) ──────────────────────────
+// A command is in scope ONLY when it (a) invokes a skill script on disk, or
+// (b) installs/runs dependencies (pip/uv/uvx/--with/-r). Everything else returns
+// null (a true no-op) so the benchmark corpus — which contains no such
+// invocations — is untouched and both seals stay byte-identical.
+//
+// Returns null (out of scope / both layers off) OR an additive result:
+//   { notes:string[], raiseToReview:boolean, deny:string|null, audit:[{action,decision}] }
+// The caller applies these strictness-increasingly and never downgrades the
+// base policy-engine decision.
+
+const DEP_COMMAND_RE =
+  /\b(?:pip3?|uv)\b[\s\S]{0,200}\binstall\b|\buvx\b|--with(?:=|\s|-requirements)|(?:^|\s)-r\s|\b(?:npm|pnpm|yarn)\b[\s\S]{0,40}\b(?:install|add)\b/i;
+
+function isDepBearingCommand(command) {
+  const c = String(command ?? "");
+  if (!c.trim()) return false;
+  return DEP_COMMAND_RE.test(c.slice(0, 64 * 1024));
+}
+
+export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}) {
+  const depsPolicy = state?.policy?.deps ?? null;
+  const skillPolicy = state?.policy?.skill ?? null;
+  if (!depsPolicy && !skillPolicy) {
+    return null;
+  }
+
+  const meta = checkSkillInvocationMeta({ command, cwd });
+  const depBearing = isDepBearingCommand(command);
+
+  // SCOPING: out of scope unless this is a skill invocation OR a dep command.
+  if (!meta.isSkillInvocation && !depBearing) {
+    return null;
+  }
+
+  const notes = [];
+  const audit = [];
+  let raiseToReview = false;
+
+  // ── Tier-1: dependency metadata hygiene (sync; never throws) ──
+  if (depsPolicy && (depBearing || meta.isSkillInvocation)) {
+    try {
+      const specs = parseManifests({ command, cwd });
+      const findings = scanDependencyMetadata(specs, depsPolicy, { command });
+      const d = depsDecision(findings, depsPolicy);
+      if (d) {
+        if (depsPolicy.mode === "enforce" && (d.decision === "deny" || d.decision === "review")) {
+          audit.push({ action: "tool.deps", decision: d.decision });
+          if (d.decision === "deny") {
+            return { notes, raiseToReview, deny: `AGT supply-chain: ${d.reason}`, audit };
+          }
+          raiseToReview = true;
+          notes.push(`AGT supply-chain (review): ${d.reason}`);
+        } else {
+          // advisory (or below-threshold enforce) → context only.
+          audit.push({ action: "tool.deps", decision: "allow" });
+          notes.push(`AGT supply-chain advisory: ${d.reason}`);
+        }
+      }
+    } catch {
+      // Tier-1 must never throw into the decision.
+    }
+  }
+
+  // ── Attestation gate (skill invocation only) ──
+  if (meta.isSkillInvocation && skillPolicy && meta.skillDir) {
+    try {
+      const enforce = skillPolicy.mode === "enforce";
+      const fileHashes = skillFileHashesSync(meta.skillDir);
+      // S1 fix: a skill whose executable content cannot be fully hashed (a
+      // genuinely empty dir, or content behind an EXTERNAL symlink not covered by
+      // the integrity hash) must NEVER be silently allowed — its identity isn't
+      // trustworthy and a swap can't be detected. Refuse to attest it; require
+      // review (enforce) and never write a user-approved cert for it.
+      const unhashable = typeof _skills.skillHasUnhashableEntries === "function"
+        ? _skills.skillHasUnhashableEntries(meta.skillDir)
+        : false;
+      if (!fileHashes.length || unhashable) {
+        audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
+        const why = !fileHashes.length
+          ? "skill has no hashable files — cannot establish a trustworthy identity"
+          : "skill contains content not covered by the integrity hash (external symlink)";
+        if (enforce) { raiseToReview = true; notes.push(`AGT skill gate: ${why} — review.`); }
+        else notes.push(`AGT skill gate advisory: ${why}.`);
+      } else {
+        const key = skillIntegrityKey(fileHashes);
+        const rec = readAttestation(key);
+        if (rec) {
+          // A record exists: its KNOWN findings (and coverage) drive the decision
+          // regardless of freshness — a known-bad skill stays known-bad. Then, if
+          // the record is STALE, do not trust its clean verdict: require review
+          // (enforce) / note (advisory) so a post-disclosure CVE or a DB bump
+          // re-triggers a scan (F1: currentDbVersion read from the cached file).
+          const fresh = isFresh(rec, {
+            maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS,
+            currentDbVersion: readCachedScannerDbVersion(),
+            nowMs: Date.now(),
+          });
+          const effect = decideFromFindings(rec, {
+            mode: skillPolicy.mode,
+            severityThreshold: skillPolicy.severityThreshold ?? "high",
+          });
+          audit.push({ action: "tool.skill-attest", decision: effect.effect });
+          if (enforce && effect.effect === "deny") {
+            return { notes, raiseToReview, deny: `AGT skill gate: ${effect.reason}`, audit };
+          }
+          if (enforce && effect.effect === "review") {
+            raiseToReview = true;
+            notes.push(`AGT skill gate (review): ${effect.reason}`);
+          } else if (effect.effect !== "allow" || (rec.rawFindings ?? []).length) {
+            notes.push(`AGT skill gate advisory: ${effect.reason}`);
+          }
+          if (!fresh) {
+            audit.push({ action: "tool.skill-attest-stale", decision: enforce ? "review" : "allow" });
+            if (enforce) { raiseToReview = true; notes.push("AGT skill gate: attestation is stale (age/DB) — re-audit to refresh."); }
+            else notes.push("AGT skill gate advisory: attestation is stale — re-audit recommended.");
+          }
+        } else {
+          // No record at all → stop-and-approve once (enforce) / note (advisory).
+          // The PostToolUse path writes a user-approved cert on the approved run
+          // so the unchanged skill is silent thereafter (a change → new key → asked again).
+          audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
+          if (enforce) {
+            raiseToReview = true;
+            notes.push("AGT skill gate: skill not yet attested — approve once to run.");
+          } else {
+            notes.push("AGT skill gate advisory: skill is not yet attested (run `skills audit` to scan it).");
+          }
+        }
+      }
+    } catch {
+      // Attestation lookup must never throw into the decision.
+    }
+  }
+
+  if (!notes.length && !raiseToReview && !audit.length) {
+    return null;
+  }
+  return { notes, raiseToReview, deny: null, audit };
+}
+
+// PostToolUse companion to checkSkillDeps' attestation gate. Records a
+// `user-approved` attestation for a skill invocation that has no fresh cert yet,
+// keyed to the skill's CURRENT file hashes — so the next unchanged run of the
+// same skill is allowed silently (a changed skill → new key → asked again).
+// SYNC, idempotent, best-effort: never overwrites a scanned cert, never throws.
+export function recordSkillApproval(state, { command = "", cwd = "" } = {}) {
+  const skillPolicy = state?.policy?.skill ?? null;
+  if (!skillPolicy) {
+    return;
+  }
+  try {
+    const meta = checkSkillInvocationMeta({ command, cwd });
+    if (!meta.isSkillInvocation || !meta.skillDir) {
+      return;
+    }
+    const fileHashes = skillFileHashesSync(meta.skillDir);
+    // S1 fix: never write a silencing cert for a skill whose content can't be
+    // fully hashed (empty dir, or an external symlink the hash doesn't cover) —
+    // approving it once must not silence a later swap behind the unhashed content.
+    const unhashable = typeof _skills.skillHasUnhashableEntries === "function"
+      ? _skills.skillHasUnhashableEntries(meta.skillDir)
+      : false;
+    if (!fileHashes.length || unhashable) {
+      return;
+    }
+    const key = skillIntegrityKey(fileHashes);
+    const existing = readAttestation(key);
+    // F2 fix: NEVER overwrite a `scanned` cert (fresh OR stale) with a clean
+    // `user-approved` one — that would launder real findings / drop the
+    // DB binding. A stale scanned cert must be refreshed by a real re-scan
+    // (`skills audit`), not by a click-through approval. Only an absent record
+    // (or an expired prior user-approval) is upgraded to user-approved here.
+    if (existing && existing.basis === "scanned") {
+      return;
+    }
+    if (existing && isFresh(existing, {
+      maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS,
+      currentDbVersion: readCachedScannerDbVersion(),
+      nowMs: Date.now(),
+    })) {
+      return;
+    }
+    writeAttestation(key, {
+      basis: "user-approved",
+      manifestHash: key,
+      rawFindings: [],
+      timestampMs: Date.now(),
+      policySnapshot: { mode: skillPolicy.mode },
+    });
+  } catch {
+    // Best-effort: a cert-write failure must never disrupt the PostToolUse path.
+  }
 }
 
 export async function evaluatePromptSubmission(state, input, invocation = {}) {
@@ -616,6 +883,16 @@ export async function inspectToolResult(state, input, invocation = {}) {
   try {
     const toolName = String(input?.toolName ?? "");
     const normalizedToolName = toolName.toLowerCase();
+
+    // Approval-once: if the tool that just RAN was a skill invocation and no
+    // fresh attestation exists, persist a `user-approved` cert keyed to the
+    // skill's current files. The PreToolUse gate raised it to review; Claude
+    // Code's permission system let it through; so reaching here means the user
+    // approved this exact skill version. Idempotent + best-effort: a scanned
+    // cert is never overwritten, and a failure never disrupts the session. This
+    // runs BEFORE the output-handling early-return so it fires for every tool.
+    recordSkillApproval(state, { command: extractCommandText(input?.toolArgs), cwd: input?.cwd });
+
     const outputHandlingMode = getOutputHandlingMode(state.policy, normalizedToolName);
     if (outputHandlingMode === "ignore") {
       return undefined;

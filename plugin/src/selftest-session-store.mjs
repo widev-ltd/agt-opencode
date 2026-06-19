@@ -60,11 +60,22 @@ try {
   const leftovers = readdirSync(dir).filter((f) => f.includes(".tmp"));
   ok("atomic: no leftover temp files after write", leftovers.length === 0);
 
-  // ── Cleanup: maxAge 0 evicts everything ────────────────────────────────────
+  // ── Cleanup: maxAge 0 evicts everything (deterministic with the >= compare) ──
+  // With a strict `>` this raced on Windows: a just-written file's high-res mtime
+  // can sit a fraction AHEAD of Date.now(), so `now - mtime` is negative and never
+  // `> 0`, leaving the file un-evicted ~13% of the time. The `>=` compare ("older-
+  // or-equal than maxAge ⇒ evict") makes maxAge=0 evict everything every time.
   mutateSession("t", "cleanme", (d) => ({ data: { ...d, x: 1 }, result: null }));
   ok("cleanup precondition: file exists", existsSync(sessionFilePath("t", "cleanme")));
-  cleanupSessions("t", 0); // anything older than 0ms → evicted
+  cleanupSessions("t", 0); // age >= 0ms → evict everything
   ok("cleanup: maxAge=0 removes session files", !existsSync(sessionFilePath("t", "cleanme")));
+
+  // ── Cleanup: a real maxAge does NOT over-evict a fresh file (>= regression) ──
+  // Guard that switching `>` to `>=` didn't start evicting still-young sessions:
+  // a file just written is far younger than a 1-hour window and must survive.
+  mutateSession("t", "keepme", (d) => ({ data: { ...d, x: 1 }, result: null }));
+  cleanupSessions("t", 3600 * 1000); // 1h window → a fresh file is well within it
+  ok("cleanup: fresh file survives a real (1h) maxAge", existsSync(sessionFilePath("t", "keepme")));
 } finally {
   delete process.env.AGT_SESSION_STORE;
   delete process.env.CLAUDE_PLUGIN_DATA;

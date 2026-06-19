@@ -133,6 +133,10 @@ export const AgtGovernance = async (ctx: PluginContext) => {
   const promptedReviews = new Set<string>();
   // sessions that have already received the AGT guard context.
   const guardedSessions = new Set<string>();
+  // Per-call tool args captured in `tool.execute.before`, so `tool.execute.after`
+  // can pass the original command into inspectToolResult to record a skill
+  // approval (the `after` payload does not carry the args).
+  const callArgs = new Map<string, Record<string, unknown> | undefined>();
 
   try {
     await mkdir(dataDir, { recursive: true });
@@ -230,6 +234,16 @@ export const AgtGovernance = async (ctx: PluginContext) => {
     // enforcement point and fails closed on any internal error.
     "tool.execute.before": async (input: ToolHookInput, output: ToolBeforeOutput) => {
       debug("tool.execute.before", input?.tool, "call", input?.callID);
+      // Remember the args so `tool.execute.after` can record a skill approval.
+      if (input?.callID) {
+        if (callArgs.size >= MAX_TRACKED) {
+          const oldest = callArgs.keys().next().value;
+          if (oldest !== undefined) {
+            callArgs.delete(oldest);
+          }
+        }
+        callArgs.set(input.callID, output?.args);
+      }
       try {
         const decision = await evaluateToolCall(input, output?.args);
         if (!decision) {
@@ -316,9 +330,16 @@ export const AgtGovernance = async (ctx: PluginContext) => {
         return;
       }
       try {
+        // The original args (captured in `tool.execute.before`) + the plugin
+        // directory let inspectToolResult record a `user-approved` skill cert
+        // when an approved skill ran. Mirrors the CC agt-hook PostToolUse path.
+        const priorArgs = input?.callID ? callArgs.get(input.callID) : undefined;
+        if (input?.callID) {
+          callArgs.delete(input.callID);
+        }
         const result = (await inspectToolResult(
           state,
-          { toolName: input?.tool, toolResult: output?.output },
+          { toolName: input?.tool, toolResult: output?.output, toolArgs: priorArgs, cwd: directory },
           { sessionId: input?.sessionID ?? "opencode-session" },
         )) as { additionalContext?: string; suppressOutput?: boolean } | undefined;
         if (!result?.additionalContext) {

@@ -373,5 +373,30 @@
       "flags": "i",
       "reason": "CLI token retrieval cue."
     }
-  ]
+  ],
+  "dependencyPolicies": {
+    "enabled": true,
+    "mode": "advisory",
+    "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). Advisory mode surfaces typosquats, unpinned/non-registry deps, untrusted indexes, and npm install-scripts as context. Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
+    "severityThreshold": "high",
+    "requirePinned": false,
+    "allow": [],
+    "deny": [],
+    "allowedIndexes": [],
+    "deniedLicenses": []
+  },
+  "skillPolicies": {
+    "enabled": true,
+    "mode": "advisory",
+    "_note": "Skill (Agent Skill) governance: integrity attestation + dangerous-pattern, secret (DLP reuse), prompt-injection, capability-profile, and source-allowlist scans. Advisory mode surfaces findings and notes when a skill is not yet attested. Set mode to 'enforce' to stop-and-approve an unattested skill once (a `user-approved` cert is then written so the unchanged skill runs silently) and to deny on at/above-threshold findings. Pre-scan skills with `skills audit` to avoid the first prompt.",
+    "blockSecrets": true,
+    "blockInjection": true,
+    "allowedSources": [],
+    "capabilityProfile": {
+      "maxNetwork": true,
+      "maxFsWrite": true,
+      "maxSubprocess": true,
+      "maxSecretRead": true
+    }
+  }
 }
