@@ -399,11 +399,9 @@
     "mode": "enforce",
     "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). ENFORCE by default: denies at/above severityThreshold; set mode to advisory to only surface findings as notes. Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
     "severityThreshold": "high",
-    "requirePinned": false,
     "allow": [],
     "deny": [],
-    "allowedIndexes": [],
-    "deniedLicenses": []
+    "allowedIndexes": []
   },
   "skillPolicies": {
     "enabled": true,

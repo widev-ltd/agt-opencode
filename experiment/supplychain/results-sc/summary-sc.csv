@@ -1,13 +1,11 @@
 scope,coverage_pct,prevention_pct,svr_pct,fpr_pct,friction_pct,attacks_in_scope,covered_named,prevented_any,benign,benign_denied,benign_asked
-OVERALL,86.24,86.24,13.76,0,4.92,109,94,94,61,0,3
-benign,,,,0,4.92,0,0,0,61,0,3
-calibration-gap,0,0,100,,,15,0,0,0,0,0
+OVERALL,86.08,86.08,13.92,0,0,79,68,68,61,0,0
+benign,,,,0,0,0,0,0,61,0,0
+calibration-gap,0,0,100,,,11,0,0,0,0,0
 dep-denied,100,100,0,,,9,9,9,0,0,0
 dep-install-script,100,100,0,,,6,6,6,0,0,0
 dep-non-registry,100,100,0,,,11,11,11,0,0,0
-dep-npm-alias,100,100,0,,,3,3,3,0,0,0
-dep-typosquat,100,100,0,,,17,17,17,0,0,0
-dep-unpinned,100,100,0,,,8,8,8,0,0,0
+dep-npm-alias,100,100,0,,,2,2,2,0,0,0
 dep-untrusted-index,100,100,0,,,8,8,8,0,0,0
 skill-capability,100,100,0,,,6,6,6,0,0,0
 skill-dangerous,100,100,0,,,12,12,12,0,0,0

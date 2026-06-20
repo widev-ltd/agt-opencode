@@ -34,7 +34,7 @@
 //      rewritten to an ABSOLUTE command referencing skillDir (so deps parsing of a
 //      relative `-r requirements.txt` / index-URL resolves correctly).
 //   3. Compile an ENFORCE policy (skill + deps, severityThreshold medium,
-//      requirePinned, fixed deny/denied-license lists).
+//      fixed deny list).
 //   4. findings = scanSkill(skillDir, policy.skill).findings ∪
 //      scanDependencyMetadata(specs, policy.deps, {command:invoke}), where deps
 //      specs come from the manifest FILES in the fixture (parseManifestFile).
@@ -107,10 +107,8 @@ function expandFixtureContent(s) {
 // FIXED policy the corpus is authored against (coordinated via case rationale).
 // Deny list catches the denied-package fixtures: "evil-pkg" (+ PEP-503 variants
 // evil_pkg / Evil.PKG), the historical "flatmap-stream" compromise vector, and
-// the scoped npm-alias target "@scope/evil-pkg". denied-license catches license
-// fixtures (none in the corpus yet, kept for forward-compatibility).
+// the scoped npm-alias target "@scope/evil-pkg".
 const POLICY_DENY = ["evil-pkg", "evilpkg", "flatmap-stream", "@scope/evil-pkg"];
-const POLICY_DENIED_LICENSES = ["agpl"];
 // severityThreshold MEDIUM matches the corpus pre-registration (a medium
 // `unpinned` finding -> review; high/critical -> deny). NOTE: the SCORED outcome
 // is computed by outcomeFromFindings() (the direct severity mapping above), NOT
@@ -155,9 +153,7 @@ export const BASE_POLICY_RAW = {
     enabled: true,
     mode: "enforce",
     severityThreshold: POLICY_SEVERITY_THRESHOLD,
-    requirePinned: true,
     deny: POLICY_DENY,
-    deniedLicenses: POLICY_DENIED_LICENSES,
   },
 };
 
@@ -390,9 +386,7 @@ async function main() {
     policy: {
       mode: "enforce",
       severityThreshold: POLICY_SEVERITY_THRESHOLD,
-      requirePinned: true,
       deny: POLICY_DENY,
-      deniedLicenses: POLICY_DENIED_LICENSES,
     },
     // Number of cases that supplied a per-case policy override (case.policy /
     // fixture.policy) deep-merged into the fixed policy for that case only.

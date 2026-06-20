@@ -66,7 +66,7 @@ const okIf = (present, name, cond) => {
 console.log(`[tools] uv=${HAVE_UV} npm=${HAVE_NPM} scanner=${HAVE_SCANNER}\n`);
 
 const advisory = compileDepsPolicy({ enabled: true, mode: "advisory" });
-const pinned = compileDepsPolicy({ enabled: true, mode: "enforce", requirePinned: true });
+const enforced = compileDepsPolicy({ enabled: true, mode: "enforce" });
 
 try {
   // ── PARSING: requirements.txt ──────────────────────────────────────────────
@@ -189,23 +189,7 @@ try {
   ok("command: 'pip install -r file' reads the requirements file",
     pipR.some((s) => s.name === "requests"));
 
-  // ── METADATA: unpinned flagged, pinned not ─────────────────────────────────
-  const mPinned = scanDependencyMetadata([{ ecosystem: "pypi", name: "requests", spec: "requests==2.31.0", source: "t" }], pinned);
-  ok("metadata: exact-pinned pypi spec NOT flagged unpinned", !hasKind(mPinned, "unpinned"));
-  const mUnpinned = scanDependencyMetadata([{ ecosystem: "pypi", name: "requests", spec: "requests>=2.0", source: "t" }], pinned);
-  ok("metadata: ranged pypi spec flagged unpinned", hasKind(mUnpinned, "unpinned"));
-  const mNpmRange = scanDependencyMetadata([{ ecosystem: "npm", name: "lodash", spec: "lodash@^4.17.21", source: "t" }], pinned);
-  ok("metadata: caret npm range flagged unpinned", hasKind(mNpmRange, "unpinned"));
-  const mNpmExact = scanDependencyMetadata([{ ecosystem: "npm", name: "lodash", spec: "lodash@4.17.21", source: "t" }], pinned);
-  ok("metadata: exact npm version NOT flagged unpinned", !hasKind(mNpmExact, "unpinned"));
-
-  // ── METADATA: typosquat caught, real package not ───────────────────────────
-  const mSquat = scanDependencyMetadata([{ ecosystem: "pypi", name: "reqeusts", spec: "reqeusts", source: "t" }], advisory);
-  ok("metadata: typosquat 'reqeusts' (≈requests) caught", hasPkg(mSquat, "typosquat", "reqeusts"));
-  const mReal = scanDependencyMetadata([{ ecosystem: "pypi", name: "requests", spec: "requests==2.31.0", source: "t" }], advisory);
-  ok("metadata: real package 'requests' NOT flagged typosquat", !hasKind(mReal, "typosquat"));
-  const mNpmSquat = scanDependencyMetadata([{ ecosystem: "npm", name: "loadsh", spec: "loadsh@1.0.0", source: "t" }], advisory);
-  ok("metadata: npm typosquat 'loadsh' (≈lodash) caught", hasPkg(mNpmSquat, "typosquat", "loadsh"));
+  // (Removed: unpinned + typosquat metadata tests — those detectors were cut.)
 
   // ── METADATA: deny list ────────────────────────────────────────────────────
   const denyPol = compileDepsPolicy({ enabled: true, mode: "enforce", deny: ["evilpkg"] });
@@ -233,20 +217,15 @@ try {
   const mIdxOk = scanDependencyMetadata([], idxPol, { command: "pip install --index-url https://pypi.org/simple foo" });
   ok("metadata: approved --index-url NOT flagged", !hasKind(mIdxOk, "untrusted-index"));
 
-  // ── METADATA: license deny (when license info attached) ────────────────────
-  const licPol = compileDepsPolicy({ enabled: true, mode: "advisory", deniedLicenses: ["gpl-3.0"] });
-  const mLic = scanDependencyMetadata([{ ecosystem: "npm", name: "copyleft", spec: "copyleft@1.0.0", source: "t", license: "GPL-3.0" }], licPol);
-  ok("metadata: denied license flagged", hasKind(mLic, "denied-license"));
-  const mLicOk = scanDependencyMetadata([{ ecosystem: "npm", name: "mit", spec: "mit@1.0.0", source: "t", license: "MIT" }], licPol);
-  ok("metadata: allowed license NOT flagged", !hasKind(mLicOk, "denied-license"));
+  // (Removed: license-deny tests — license-deny was cut as compliance-not-security.)
 
   // ── DECISION mapping (mirrors dlpDecision) ─────────────────────────────────
-  const highF = [{ kind: "typosquat", severity: "high", package: "reqeusts", detail: "x" }];
-  const medF = [{ kind: "unpinned", severity: "medium", package: "x", detail: "x" }];
+  const highF = [{ kind: "non-registry-source", severity: "high", package: "p", detail: "x" }];
+  const medF = [{ kind: "yanked", severity: "medium", package: "x", detail: "x" }];
   ok("decision: advisory high → allow", depsDecision(highF, advisory).decision === "allow");
-  ok("decision: enforce high (≥medium threshold) → deny", depsDecision(highF, pinned).decision === "deny");
-  ok("decision: enforce medium (=threshold) → deny", depsDecision(medF, pinned).decision === "deny");
-  ok("decision: no findings → null", depsDecision([], pinned) === null);
+  ok("decision: enforce high (≥medium threshold) → deny", depsDecision(highF, enforced).decision === "deny");
+  ok("decision: enforce medium (=threshold) → deny", depsDecision(medF, enforced).decision === "deny");
+  ok("decision: no findings → null", depsDecision([], enforced) === null);
   const lowThresh = compileDepsPolicy({ enabled: true, mode: "enforce", severityThreshold: "critical" });
   ok("decision: high below critical threshold → review", depsDecision(highF, lowThresh).decision === "review");
 
@@ -360,26 +339,7 @@ try {
   ok("P5: approved PIP_INDEX_URL NOT flagged",
     !hasKind(scanDependencyMetadata([], p5Pol, { command: "PIP_INDEX_URL=https://pypi.org/simple pip install foo" }), "untrusted-index"));
 
-  // ── P6/P7: typosquat tuning — catch dist-2/affix/separator, spare real names ─
-  const p6pypi = compileDepsPolicy({ enabled: true, mode: "advisory",
-    popularPackages: { pypi: ["mongoose"] } });
-  const p6npm = compileDepsPolicy({ enabled: true, mode: "advisory",
-    popularPackages: { npm: ["cross-env", "mongoose", "vue"] } });
-  ok("P6: 'python-requests' (affix-wrap of requests) caught",
-    hasPkg(scanDependencyMetadata([{ ecosystem: "pypi", name: "python-requests", spec: "python-requests", source: "t" }], advisory), "typosquat", "python-requests"));
-  ok("P6: 'crossenv' (separator-swap of cross-env) caught",
-    hasPkg(scanDependencyMetadata([{ ecosystem: "npm", name: "crossenv", spec: "crossenv@1", source: "t" }], p6npm), "typosquat", "crossenv"));
-  ok("P6: 'mongose' (≈mongoose) caught",
-    hasPkg(scanDependencyMetadata([{ ecosystem: "pypi", name: "mongose", spec: "mongose", source: "t" }], p6pypi), "typosquat", "mongose"));
-  // P7 false-positive guards: real short/near names must NOT fire
-  ok("P7: real 'request' NOT flagged typosquat (vs requests)",
-    !hasKind(scanDependencyMetadata([{ ecosystem: "pypi", name: "request", spec: "request==2.0", source: "t" }], advisory), "typosquat"));
-  ok("P7: real 'urllib' NOT flagged typosquat (vs urllib3)",
-    !hasKind(scanDependencyMetadata([{ ecosystem: "pypi", name: "urllib", spec: "urllib==1.0", source: "t" }], advisory), "typosquat"));
-  ok("P7: real 'click' NOT flagged typosquat",
-    !hasKind(scanDependencyMetadata([{ ecosystem: "pypi", name: "click", spec: "click==8.0", source: "t" }], advisory), "typosquat"));
-  ok("P7: real 'vuex' NOT flagged typosquat (vs vue)",
-    !hasKind(scanDependencyMetadata([{ ecosystem: "npm", name: "vuex", spec: "vuex@4", source: "t" }], p6npm), "typosquat"));
+  // (Removed: P6/P7 typosquat-tuning tests — the name-distance heuristic was cut.)
 
   // ── P8: pyproject [build-system].requires + poetry TABLE form ──────────────
   const p8Path = writeCanon("pyproject.toml", [

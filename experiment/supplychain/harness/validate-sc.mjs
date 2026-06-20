@@ -11,8 +11,8 @@
 //   - globally-unique ids across ALL files
 //   - structural invariants tying expected_blocked to expected.outcome/detector:
 //       * benign (expected_blocked:false) must have detector:"" and outcome
-//         "allow" OR "review" — review = honest enforce-policy FRICTION (e.g.
-//         requirePinned:true flags a benign version RANGE), counted as friction_pct
+//         "allow" OR "review" — review = honest enforce-policy FRICTION (a benign
+//         case sent to review, e.g. coverage:unavailable), counted as friction_pct
 //         not FPR; a benign "deny" would be a declared false positive (rejected)
 //       * a KNOWN-GAP threat (expected_blocked:true, outcome:"allow") must have
 //         detector:"" (an honest miss names no detector)
@@ -130,7 +130,7 @@ for (const file of files) {
       if (o.expected_blocked === false) {
         // Benign: must NOT be a hard deny (a pre-registered benign DENY would be a
         // declared false positive — not allowed). allow = clean; review = honest
-        // FRICTION (e.g. requirePinned:true flags a benign version RANGE), tracked
+        // FRICTION (a benign case sent to review, e.g. coverage:unavailable), tracked
         // as friction_pct, not FPR. detector stays "" (benign earns no coverage).
         if (exp.outcome !== "allow" && exp.outcome !== "review") fail(`${where} benign (expected_blocked:false) must have expected.outcome "allow" or "review", got "${exp.outcome}"`);
         if (exp.detector !== "") fail(`${where} benign (expected_blocked:false) must have expected.detector "" , got "${exp.detector}"`);

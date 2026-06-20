@@ -93,12 +93,26 @@ agt-opencode policy apply    --file ./my-policy.json
 > **Restart OpenCode after `apply`/`install`/`update`.** The plugin reads its
 > policy at load time.
 
-### Auditing skills ahead of use
+### Trusting skills — two tiers
 
-The runtime gate (Tier 1) is fast and scanner-free; the deep transitive CVE scan
-(Tier 2) runs off the hot path via `skills audit`. Run it before a skill's first
-use so the runtime gate finds a fresh `scanned` attestation and allows silently
-instead of routing to review:
+A skill is trusted by a **stamp**. There are two ways to get one:
+
+**1. CI-signed (strong, durable) — recommended for shared/published skills.** A
+signer *outside the agent box* (CI / HSM) scans the skill and, only if it passes,
+signs the attestation with a private key the agent never holds. The signed
+`.agt-attestation.json` ships **alongside the skill**; the plugin verifies it with
+the trusted **public key** you set in `skillPolicies.trustedSigners` (delivered out
+of band — see [CONFIGURATION.md](CONFIGURATION.md#governance-extensions)). A local
+attacker can't forge it. Run the **separate** signer in CI (never on an agent box):
+
+```bash
+node tools/skill-signer/sign.mjs <skill-dir> --key <ci-private.pem>   # PASS → .agt-attestation.json; FAIL → exit 1
+```
+
+**2. Local 1-day grace (weak, default) — for dev / unsigned skills.** An unsigned
+skill is scanned locally on first use and, if clean, stamped for **1 day**
+(forgeable but time-boxed). Pre-stamp it so the first real use is a cache hit, not an
+inline scan:
 
 ```bash
 agt-opencode skills audit ~/.config/opencode/skills/my-skill
@@ -106,17 +120,17 @@ agt-opencode skills audit ./skills/*                       # several at once
 agt-opencode skills audit ./skills/x --scanner osv-scanner # force a scanner
 ```
 
-It resolves the **full transitive tree** (`uv` for Python incl. PEP 723 inline
-metadata; `npm` for Node) and runs an auto-detected scanner (`trivy` /
-`osv-scanner` / `pip-audit`) for CVEs, then writes an attestation keyed to the
-skill's file hashes. A later run with unchanged files is a cache hit (no rescan).
+Both resolve the **full transitive tree** (`uv` for Python incl. PEP 723 inline;
+`npm` for Node) and run an auto-detected scanner (`trivy` / `osv-scanner` /
+`pip-audit`). Set `skillPolicies.requireSignature: true` for **strict mode** — only
+CI-signed skills run, no local fallback.
 
-> **Fail-safe:** the attestation records *honest coverage*. A skill is stamped
-> clean-eligible only when its deps were actually resolved transitively **and**
-> scanned clean. If `uv`/`npm` or a scanner is missing, the resolver errors, or a
-> bare-import JS skill has no manifest, coverage is `unavailable` → the skill is
-> treated as **unverified = unsafe** (review/deny), never a false-clean. Install
-> `uv`/`npm` + a scanner on `PATH` for the audit to produce a clean stamp.
+> **Fail-safe behavior:** a skill is stamped clean-eligible only when its deps were
+> actually resolved transitively **and** scanned clean (or carry a valid CI
+> signature). If `uv`/`npm` or a scanner is missing, the resolver errors, or a
+> bare-import JS skill has no manifest, coverage is `unavailable` → **unverified =
+> unsafe** (review/deny), never a false-clean. The scan catches *known* CVEs/patterns
+> (not novel/zero-day); only the CI-signed tier resists a local forger.
 
 ## The audit log
 

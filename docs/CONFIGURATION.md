@@ -109,11 +109,13 @@ They work in two tiers:
 
 - **Tier 1 (runtime, in-process, no network).** `dependencyPolicies` parses a
   skill's manifests — Python `requirements.txt` / `pyproject.toml` / **PEP 723
-  inline metadata**, and Node `package.json` / lockfiles — and applies hygiene
-  rules: typosquat, unpinned, denied package, non-registry/editable install,
-  untrusted index, npm install-scripts, license. `skillPolicies` adds metadata
-  hygiene, dangerous-pattern / secret / injection / capability scans, a source
-  allowlist, and an **attestation lookup**.
+  inline metadata**, and Node `package.json` / lockfiles — and applies deterministic
+  hygiene a CVE scanner is blind to: denied package, non-registry/editable install,
+  untrusted index (dependency-confusion), npm install-scripts. `skillPolicies` adds
+  metadata hygiene, dangerous-pattern / secret / injection / capability scans, a
+  source allowlist, and an **attestation lookup**. (Typosquat name-matching,
+  unpinned, and license-deny were removed — FP-prone heuristic / lockfile's job /
+  compliance, not security.)
 - **Tier 2 (`skills audit`, off the hot path).** Resolves the **full transitive
   tree** (`uv` / `npm`) and runs an auto-detected CVE scanner (`trivy` /
   `osv-scanner` / `pip-audit`), then writes a `scanned` attestation so a later
@@ -125,9 +127,7 @@ Useful keys (both accept `mode` and merge over the shipped defaults):
 ```jsonc
 "dependencyPolicies": {
   "mode": "enforce",
-  "requirePinned": true,                 // unpinned spec → finding
   "deny": ["evil-pkg"],                  // package names always denied
-  "deniedLicenses": ["agpl"],            // license deny list
   "severityThreshold": "medium",         // min severity that escalates to deny
   "allowedIndexes": ["https://pypi.org/simple"]  // [] = any index OK
 }
@@ -139,9 +139,21 @@ Useful keys (both accept `mode` and merge over the shipped defaults):
     "maxFsWrite": false, "maxSecretRead": false
   },
   "severityThreshold": "high",           // min finding severity that escalates (default high)
-  "maxAgeMs": 604800000                  // attestation re-audit window (default 7 days)
+  "trustedSigners": ["/etc/agt/ci-public.pem"],  // CI public key(s): PEM or file path (delivered out of band)
+  "requireSignature": false,             // true = STRICT: only CI-signed skills run (no 1-day local fallback)
+  "maxAgeMs": 604800000,                 // CI-signed stamp window (default 7 days)
+  "localGraceMs": 86400000               // unsigned local-scan stamp window (default 1 day)
 }
 ```
+
+> **Two trust tiers.** A **CI-signed** stamp (verified against `trustedSigners`, a
+> public key you deliver out of band) is trusted for `maxAgeMs` — unforgeable by a
+> local attacker, because the private key lives in CI/HSM, off the agent box. A
+> signature **is** the pass: CI signs only skills that scanned clean, so the gate
+> does not re-judge a signed stamp. An **unsigned** skill is scanned locally and
+> gets a 1-day (`localGraceMs`) stamp — forgeable but time-boxed. `requireSignature:
+> true` drops the local tier (CI-signed only). The CI signer is a separate tool
+> (`tools/skill-signer/sign.mjs`), run by CI. See [USAGE.md](USAGE.md#auditing-skills-ahead-of-use).
 
 > **Capability least-privilege.** A skill declares what it may do in its
 > `SKILL.md` frontmatter (`allowed-capabilities: [network, subprocess, …]`). A
@@ -149,10 +161,13 @@ Useful keys (both accept `mode` and merge over the shipped defaults):
 > `capabilityProfile` budget — is flagged. The budget is the hard ceiling: a
 > self-declaration can never override a capability the operator set to `false`.
 
-> **Fail-safe guarantee.** In `enforce`, a skill is silent-allowed only when its
-> deps were actually resolved transitively **and** scanned clean. If they can't be
-> (no resolver/scanner, resolver error, bare-import JS with no manifest) coverage
-> is `unavailable` → unverified = unsafe (review/deny), never a false-clean.
+> **Fail-safe behavior (a guardrail, not a guarantee).** In `enforce`, a skill is
+> silent-allowed only when its deps were actually resolved transitively **and**
+> scanned clean (or carry a valid CI signature). If they can't be (no
+> resolver/scanner, resolver error, bare-import JS with no manifest) coverage is
+> `unavailable` → unverified = unsafe (review/deny), never a false-clean. It catches
+> *known* CVEs/patterns, not novel/zero-day; only the CI-signed tier resists a local
+> forger; a true boundary needs OS-level isolation, which this is not.
 
 ## Per-project override
 

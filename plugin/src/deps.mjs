@@ -12,11 +12,13 @@
 // two tiers:
 //
 //   TIER 1 (sync, runtime-safe): parse the manifests / install command, then run
-//     cheap METADATA checks (unpinned, non-registry source, typosquat, allow/deny,
-//     index-URL guard, license deny, install-script presence). No network, no
-//     subprocess — safe to call from the synchronous decision path (the same path
-//     as checkForExfil). It NEVER throws: malformed or huge input yields findings
-//     or an empty array, never an exception that would crash a hook.
+//     cheap, DETERMINISTIC metadata checks that cover risks a CVE scanner is blind
+//     to: non-registry source, allow/deny list, index-URL guard (dependency
+//     confusion), and npm install-script presence (install-time code execution).
+//     No network, no subprocess — safe to call from the synchronous decision path.
+//     It NEVER throws: malformed or huge input yields findings or an empty array.
+//     (Typosquat name-matching, unpinned, and license-deny were removed — see the
+//     note in scanOneSpec: FP-prone heuristic / lockfile's job / compliance-not-security.)
 //
 //   TIER 2 (async, audit-only): resolve the transitive set (from a lockfile when
 //     present) and shell out to an installed vulnerability scanner (trivy /
@@ -25,17 +27,14 @@
 //     degrades gracefully: no scanner installed / timeout / unparseable output
 //     → { available:false, findings:[], note } rather than an exception.
 //
-// THREAT MODEL:
-//   - Typosquatting: `reqeusts`, `python-dateutil` vs `python-datetime`, `loadsh`.
-//     A bounded edit-distance check against a configurable popular-package list.
+// THREAT MODEL (Tier-1 covers what the CVE scanner does NOT):
 //   - Dependency confusion / unapproved index: `--index-url` / `--extra-index-url`
 //     pointing at an attacker-controlled or simply unapproved registry.
 //   - Install-time code execution: npm pre/post/install lifecycle scripts; a
 //     python `setup.py` that contains code (not a static pyproject build).
-//   - Floating versions: an unpinned spec lets a later malicious release land
-//     silently. requirePinned flags any spec without an exact version.
 //   - Non-registry sources: `git+https://…`, `file:`, a bare URL — code that
 //     bypasses the registry's (weak) review entirely.
+//   (Known CVEs in the transitive tree are Tier-2's job, delegated to the scanner.)
 //
 // POLICY INTEGRATION (mirrors compileDlpPolicy):
 //   depsPolicies.mode = "advisory"  → findings surfaced as context, no deny
@@ -54,23 +53,6 @@ const MAX_MANIFEST_BYTES = 2 * 1024 * 1024; // 2 MiB
 const MAX_COMMAND_LENGTH = 64 * 1024; // 64 KiB
 const MAX_SPECS = 5000; // cap the number of specs we will ever report on
 
-// ── Default popular-package list for typosquat detection ─────────────────────
-// A SMALL, high-value default. Operators extend it via depsPolicies.popularPackages.
-// The bar for inclusion: a package common enough that a one-edit typo is a likely
-// squat target. Keep it short — a huge list inflates the O(specs × packages × len)
-// edit-distance cost on the sync path.
-export const DEFAULT_POPULAR_PYPI = [
-  "requests", "urllib3", "numpy", "pandas", "boto3", "botocore", "setuptools",
-  "pip", "wheel", "cryptography", "flask", "django", "fastapi", "pydantic",
-  "scipy", "scikit-learn", "matplotlib", "pytest", "pyyaml", "python-dateutil",
-  "click", "jinja2", "sqlalchemy", "aiohttp", "httpx", "tensorflow", "torch",
-];
-export const DEFAULT_POPULAR_NPM = [
-  "react", "lodash", "express", "axios", "chalk", "commander", "debug",
-  "moment", "webpack", "typescript", "eslint", "jest", "vue", "next",
-  "dotenv", "uuid", "classnames", "redux", "rxjs", "babel-core", "node-fetch",
-];
-
 // ── Policy compilation ───────────────────────────────────────────────────────
 
 export function compileDepsPolicy(raw) {
@@ -78,23 +60,15 @@ export function compileDepsPolicy(raw) {
     return null;
   }
   const mode = raw.mode === "enforce" ? "enforce" : "advisory";
-  const popularPackages = {
-    pypi: dedupeLower([...DEFAULT_POPULAR_PYPI, ...arrayOf(raw.popularPackages?.pypi ?? raw.popularPackages)]),
-    npm: dedupeLower([...DEFAULT_POPULAR_NPM, ...arrayOf(raw.popularPackages?.npm)]),
-  };
   return {
     mode,
     severityThreshold: normalizeSeverity(raw.severityThreshold, "medium"),
     allow: dedupeLower(arrayOf(raw.allow)),
     deny: dedupeLower(arrayOf(raw.deny)),
-    requirePinned: raw.requirePinned === true,
     // Default registries are the canonical public ones; an operator REPLACES this
     // to lock to a private mirror. An empty allowedIndexes means "any index is OK"
     // (the index-URL guard then only flags clearly-unapproved when a list exists).
     allowedIndexes: arrayOf(raw.allowedIndexes).map((s) => String(s).toLowerCase()),
-    deniedLicenses: arrayOf(raw.deniedLicenses).map((s) => String(s).toLowerCase()),
-    popularPackages,
-    typosquatDistance: Number.isFinite(raw.typosquatDistance) ? Math.max(1, raw.typosquatDistance | 0) : 1,
     maxAgeMs: Number.isFinite(raw.maxAgeMs) ? Number(raw.maxAgeMs) : null,
   };
 }
@@ -382,9 +356,9 @@ function parsePoetryDependencyTable(section) {
       spec = canonicalSpec("pypi", `${key} @ ${kind}${srcm[2]}`, "pyproject:poetry");
     } else {
       // Recover the version string: `version = "..."` in an inline table, else a
-      // top-level string value. Map poetry constraint syntax to a PEP508-ish spec
-      // so isPinned classifies it correctly: a bare exact version → `==x`, anything
-      // with a range operator (^ ~ > < * ,) is preserved as-is so it reads unpinned.
+      // top-level string value. Map poetry constraint syntax to a PEP508-ish spec:
+      // a bare exact version → `==x`; anything with a range operator (^ ~ > < * ,)
+      // is preserved as-is (so the resolved spec carries the real constraint).
       const inlineVer = /version\s*=\s*["']([^"']+)["']/.exec(trimmed);
       const strVal = inlineVer ? null : /=\s*["']([^"']+)["']/.exec(trimmed);
       const ver = inlineVer ? inlineVer[1] : (strVal ? strVal[1] : null);
@@ -588,7 +562,6 @@ function scanOneSpec(spec, policy) {
       detail: `Package "${spec.name}" is on the operator deny list.` });
     return out;
   }
-  const allowed = policy.allow.length > 0 && canon(policy.allow);
 
   // Non-registry source: git+, file:, bare URL, local path, direct-reference @ url.
   const nonReg = nonRegistrySource(spec.spec, ecosystem);
@@ -597,30 +570,11 @@ function scanOneSpec(spec, policy) {
       detail: `Dependency is fetched from a non-registry source (${nonReg}), bypassing index review: ${truncate(spec.spec, 120)}` });
   }
 
-  // Typosquat: bounded edit-distance vs the popular list, EXCLUDING an exact match.
-  const popular = ecosystem === "npm" ? policy.popularPackages.npm : policy.popularPackages.pypi;
-  const squat = nearestPopular(name, popular, policy.typosquatDistance);
-  if (squat) {
-    out.push({ kind: "typosquat", severity: "high", package: spec.name,
-      detail: `Package name "${spec.name}" is within edit-distance ${squat.distance} of popular package "${squat.name}" — possible typosquat.` });
-  }
-
-  // Unpinned (no exact version) — skipped for allow-listed packages and for
-  // non-registry specs (already flagged) and synthetic lock-derived specs.
-  if (policy.requirePinned && !allowed && !nonReg && !isPinned(spec, ecosystem)) {
-    out.push({ kind: "unpinned", severity: "medium", package: spec.name,
-      detail: `Dependency "${spec.spec}" is not pinned to an exact version; a later release could be malicious.` });
-  }
-
-  // License deny (only when license info is attached to the spec, e.g. from a
-  // resolved lockfile/metadata pass).
-  if (policy.deniedLicenses.length && spec.license) {
-    const lic = String(spec.license).toLowerCase();
-    if (policy.deniedLicenses.some((d) => lic.includes(d))) {
-      out.push({ kind: "denied-license", severity: "medium", package: spec.name,
-        detail: `Package "${spec.name}" declares license "${spec.license}", which is on the deny list.` });
-    }
-  }
+  // NOTE: typosquat (name-distance), unpinned, and license-deny checks were REMOVED
+  // deliberately. Typosquat name-matching was an FP-prone bespoke heuristic that
+  // reinvents (badly) what the scanner/registry ecosystem should own; unpinned is
+  // the lockfile's job; license-deny is compliance, not security. The kept checks
+  // below cover real risks a CVE scanner is blind to. See experiment/independent/RESULTS.md.
 
   // Yanked / outdated — best-effort, only when flags survived parsing/metadata.
   if (spec.yanked) {
@@ -1492,131 +1446,6 @@ export async function attestDepsScan(resolvedSpecs, opts = {}) {
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
-
-// Common ecosystem affixes that wrap a popular name in a typosquat: `python-requests`
-// (prefix), `requests-py` (suffix), `node-fetch`/`fetch-js`. A name that is exactly a
-// popular package plus one of these affixes is a high-confidence squat.
-const SQUAT_AFFIXES = ["python", "py", "node", "js", "lib", "the", "real", "official", "pkg"];
-
-// Names that are short and close to a popular package but are themselves REAL,
-// widely-used packages — never flag these as squats. (Distinct from the popular
-// list: these are the legitimate "near-miss" packages the squat heuristics would
-// otherwise false-positive on.) Compared case-insensitively.
-const LEGIT_NAMES = new Set([
-  "request", "urllib", "click", "vuex", "vue", "vite", "next", "nuxt",
-  "preact", "redux", "axios", "chalk", "debug", "rxjs", "uuid",
-]);
-
-// A name is "short" if raw edit-distance is too FP-prone to trust on its own.
-const SHORT_NAME_LEN = 5;
-
-// Strip PEP503-style separators so `cross-env`↔`crossenv` and `python-requests`
-// compare structurally. Lowercased.
-function deseparate(s) {
-  return String(s ?? "").toLowerCase().replace(/[-_.]+/g, "");
-}
-
-// Bounded squat detection: returns {name, distance} of the nearest popular package
-// this name is likely squatting, or null. Layers three heuristics so we catch
-// affix/separator squats (which raw distance misses) WITHOUT false-positiving real
-// short names:
-//   1. self-exclusion: an exact popular match or a known-legit name is never a squat;
-//   2. separator-swap / affix-wrap: structural squats reported regardless of length;
-//   3. raw Damerau-Levenshtein ≤ maxDistance, but ONLY for names long enough that a
-//      single edit is unlikely to be a coincidence (short names use 1+2 only).
-function nearestPopular(name, popular, maxDistance) {
-  if (!name) return null;
-  const lower = String(name).toLowerCase();
-  if (LEGIT_NAMES.has(lower)) return null; // a real package, not a squat
-  for (const p of popular) {
-    if (p === lower || p === name) return null; // exact = the real package
-  }
-
-  const nameDesep = deseparate(name);
-
-  // (2a) Separator-swap: identical once separators are removed, but the raw forms
-  // differ (`crossenv`↔`cross-env`, `node_fetch`↔`node-fetch`). Distance 1.
-  for (const p of popular) {
-    if (p === lower) continue;
-    if (deseparate(p) === nameDesep) return { name: p, distance: 1 };
-  }
-
-  // (2b) Affix-wrap: the name is exactly a popular package (deseparated) plus a
-  // known ecosystem affix on the front or back (`python-requests`, `lodash-js`).
-  // Require the popular base to be ≥4 chars so we don't wrap a tiny base.
-  for (const p of popular) {
-    const pDesep = deseparate(p);
-    if (pDesep.length < 4 || pDesep === nameDesep) continue;
-    if (nameDesep.length <= pDesep.length) continue;
-    let extra = null;
-    if (nameDesep.startsWith(pDesep)) extra = nameDesep.slice(pDesep.length);
-    else if (nameDesep.endsWith(pDesep)) extra = nameDesep.slice(0, nameDesep.length - pDesep.length);
-    if (extra != null && SQUAT_AFFIXES.includes(extra)) return { name: p, distance: 2 };
-  }
-
-  // (3) Raw edit-distance — skipped for SHORT names (a single edit on a tiny name
-  // is too often a coincidence: `vue`↔`vuex`, `request`↔`requests`).
-  if (lower.length < SHORT_NAME_LEN) return null;
-  let best = null;
-  for (const p of popular) {
-    // A transposition keeps length equal, so the length-difference prune must use
-    // the same ceiling as the distance check (don't prune equal-length candidates).
-    if (Math.abs(p.length - lower.length) > maxDistance) continue;
-    const d = damerauLevenshtein(lower, p, maxDistance);
-    if (d >= 1 && d <= maxDistance && (best == null || d < best.distance)) {
-      best = { name: p, distance: d };
-      if (d === 1) break;
-    }
-  }
-  return best;
-}
-
-// Damerau-Levenshtein with an early-exit ceiling. Counts an ADJACENT TRANSPOSITION
-// as a single edit — the canonical typosquat shape (`reqeusts`↔`requests`,
-// `loadsh`↔`lodash`), which plain Levenshtein scores as 2. Returns ceiling+1 once
-// the best possible distance for a row exceeds the ceiling, bounding the work.
-function damerauLevenshtein(a, b, ceiling) {
-  const la = a.length, lb = b.length;
-  if (Math.abs(la - lb) > ceiling) return ceiling + 1;
-  // Three rolling rows: prev2 (i-2), prev (i-1), curr (i).
-  let prev2 = new Array(lb + 1).fill(0);
-  let prev = new Array(lb + 1);
-  let curr = new Array(lb + 1);
-  for (let j = 0; j <= lb; j++) prev[j] = j;
-  for (let i = 1; i <= la; i++) {
-    curr[0] = i;
-    let rowMin = curr[0];
-    const ca = a.charCodeAt(i - 1);
-    for (let j = 1; j <= lb; j++) {
-      const cb = b.charCodeAt(j - 1);
-      const cost = ca === cb ? 0 : 1;
-      let v = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
-      // Adjacent transposition: a[i-1]==b[j-2] && a[i-2]==b[j-1].
-      if (i > 1 && j > 1 && ca === b.charCodeAt(j - 2) && a.charCodeAt(i - 2) === cb) {
-        v = Math.min(v, prev2[j - 2] + 1);
-      }
-      curr[j] = v;
-      if (v < rowMin) rowMin = v;
-    }
-    if (rowMin > ceiling) return ceiling + 1;
-    const tmp = prev2; prev2 = prev; prev = curr; curr = tmp;
-  }
-  return prev[lb];
-}
-
-// A spec is "pinned" if it names an exact version. pypi: `==x.y` (and not a range
-// like `>=`); npm: an exact `name@1.2.3` (not a range / caret / tilde / tag / url).
-function isPinned(spec, ecosystem) {
-  const s = String(spec.spec ?? "");
-  if (ecosystem === "pypi") {
-    return /==\s*[\w.!*+-]+/.test(s) && !/[<>~^]|!=/.test(s.replace(/!=.*/g, ""));
-  }
-  // npm: extract the range after the last (non-scope) '@'.
-  const range = npmRange(s);
-  if (!range) return false; // no version specified at all → unpinned
-  if (/^(?:git|github:|file:|https?:|link:|workspace:)/i.test(range)) return false;
-  return /^\d+\.\d+\.\d+(?:[-+][\w.]+)?$/.test(range.trim());
-}
 
 function npmRange(spec) {
   let s = spec;

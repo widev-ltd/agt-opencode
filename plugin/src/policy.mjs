@@ -32,7 +32,10 @@ import {
   writeAttestation,
   isFresh,
   decideFromFindings,
+  verifyAttestationSignature,
+  readShippedAttestation,
   DEFAULT_MAX_AGE_MS,
+  LOCAL_GRACE_MS,
 } from "./attestation.mjs";
 import { withFileLock, writeFileAtomicSync, dataDir } from "./session-store.mjs";
 
@@ -555,6 +558,18 @@ export async function evaluatePreToolUse(state, input, invocation = {}) {
     // It NEVER downgrades the base decision: it may add notes, raise to review,
     // or (enforce only) hard-deny — all strictness-increasing.
     if (state.policy.deps || state.policy.skill) {
+      // First (async, off the sync gate): for an unsigned skill lacking fresh trust,
+      // run a local scan on demand so the gate has a stamp to decide on (the 1-day
+      // local tier). No-op in strict mode / when fresh trust already exists / for
+      // non-skill calls — so the benchmark corpus (no skill invocations) is untouched.
+      try {
+        await ensureSkillScanned(state, {
+          command: extractCommandText(input?.toolArgs),
+          cwd: input?.cwd,
+        });
+      } catch {
+        // scan failure never blocks the decision; the gate fails safe below.
+      }
       let sc;
       try {
         sc = checkSkillDeps(state, {
@@ -710,47 +725,67 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
         else notes.push(`AGT skill gate advisory: ${why}.`);
       } else {
         const key = skillIntegrityKey(fileHashes);
-        const rec = readAttestation(key);
-        if (rec) {
-          // A record exists: its KNOWN findings (and coverage) drive the decision
-          // regardless of freshness — a known-bad skill stays known-bad. Then, if
-          // the record is STALE, do not trust its clean verdict: require review
-          // (enforce) / note (advisory) so a post-disclosure CVE or a DB bump
-          // re-triggers a scan (F1: currentDbVersion read from the cached file).
-          const fresh = isFresh(rec, {
-            maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS,
-            currentDbVersion: readCachedScannerDbVersion(),
-            nowMs: Date.now(),
-          });
-          const effect = decideFromFindings(rec, {
+        const trusted = skillPolicy.trustedSigners ?? [];
+        const dbVersion = readCachedScannerDbVersion();
+        const ciMaxAge = skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
+        const localMaxAge = skillPolicy.localGraceMs ?? LOCAL_GRACE_MS;
+
+        // TIER 1 (strong, durable): a CI-signed stamp — shipped alongside the skill
+        // or in the local cache — that VERIFIES under a trusted key, is BOUND to
+        // THESE files (rec.key === key), and is within the durable window. A
+        // signature IS the pass: CI never signs a failing skill, so a fresh CI
+        // stamp → allow with no findings re-evaluation. The signing key lives off
+        // the agent's box, so a local attacker cannot forge this tier.
+        const shipped = readShippedAttestation(meta.skillDir);
+        const cacheRec = readAttestation(key);
+        const ciStamp = [shipped, cacheRec].find(
+          (r) => r && r.key === key && verifyAttestationSignature(r, trusted),
+        );
+        const ciFresh = ciStamp && isFresh(ciStamp, { maxAgeMs: ciMaxAge, currentDbVersion: dbVersion, nowMs: Date.now() });
+
+        if (ciFresh) {
+          audit.push({ action: "tool.skill-attest-ci", decision: "allow" });
+          // CI-signed pass → allow (silent).
+        } else if (skillPolicy.requireSignature === true) {
+          // STRICT mode: no fresh CI pass and NO local fallback → block/review.
+          audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
+          if (enforce) { raiseToReview = true; notes.push("AGT skill gate: no valid CI signature (signature required) — review."); }
+          else notes.push("AGT skill gate advisory: no valid CI signature (signature-required mode).");
+        } else if (cacheRec) {
+          // TIER 2 (weak, 1-day grace): an unsigned, locally-scanned stamp. Findings
+          // drive the decision (clean→allow, vuln→deny); trust expires after the
+          // 1-day window (DB bump / post-disclosure CVE re-triggers a scan). This
+          // tier is forgeable by a local writer — the 1-day expiry caps the exposure.
+          const fresh = isFresh(cacheRec, { maxAgeMs: localMaxAge, currentDbVersion: dbVersion, nowMs: Date.now() });
+          const effect = decideFromFindings(cacheRec, {
             mode: skillPolicy.mode,
             severityThreshold: skillPolicy.severityThreshold ?? "high",
           });
-          audit.push({ action: "tool.skill-attest", decision: effect.effect });
+          audit.push({ action: "tool.skill-attest-local", decision: effect.effect });
           if (enforce && effect.effect === "deny") {
             return { notes, raiseToReview, deny: `AGT skill gate: ${effect.reason}`, audit };
           }
           if (enforce && effect.effect === "review") {
             raiseToReview = true;
             notes.push(`AGT skill gate (review): ${effect.reason}`);
-          } else if (effect.effect !== "allow" || (rec.rawFindings ?? []).length) {
+          } else if (effect.effect !== "allow" || (cacheRec.rawFindings ?? []).length) {
             notes.push(`AGT skill gate advisory: ${effect.reason}`);
           }
           if (!fresh) {
             audit.push({ action: "tool.skill-attest-stale", decision: enforce ? "review" : "allow" });
-            if (enforce) { raiseToReview = true; notes.push("AGT skill gate: attestation is stale (age/DB) — re-audit to refresh."); }
-            else notes.push("AGT skill gate advisory: attestation is stale — re-audit recommended.");
+            if (enforce) { raiseToReview = true; notes.push("AGT skill gate: local scan is stale (>1 day) — re-scan to refresh."); }
+            else notes.push("AGT skill gate advisory: local scan is stale (>1 day) — re-scan recommended.");
           }
         } else {
-          // No record at all → stop-and-approve once (enforce) / note (advisory).
-          // The PostToolUse path writes a user-approved cert on the approved run
-          // so the unchanged skill is silent thereafter (a change → new key → asked again).
+          // No CI signature and no local stamp — a local scan could not establish
+          // trust (ensureSkillScanned runs first; absence here means it could not
+          // scan, e.g. no resolver/scanner installed). Fail safe → review/note.
           audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
           if (enforce) {
             raiseToReview = true;
-            notes.push("AGT skill gate: skill not yet attested — approve once to run.");
+            notes.push("AGT skill gate: skill not attested and no local scan available — review (install uv/npm + a scanner, or ship a CI-signed attestation).");
           } else {
-            notes.push("AGT skill gate advisory: skill is not yet attested (run `skills audit` to scan it).");
+            notes.push("AGT skill gate advisory: skill not yet attested (run `skills audit`, ship a CI signature, or install a scanner).");
           }
         }
       }
@@ -765,6 +800,45 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
   return { notes, raiseToReview, deny: null, audit };
 }
 
+// Async companion to checkSkillDeps, run by the PreToolUse path BEFORE the (sync)
+// gate decides. For an unsigned skill with no fresh trust, it runs a local scan on
+// demand and writes a `scanned` stamp the gate reads as the 1-day local tier — so
+// an unsigned skill is usable for a day after a real local scan, instead of being
+// blocked. No-op when: strict mode (requireSignature), a fresh CI signature already
+// covers it, or a fresh local stamp already exists. auditSkillDir NEVER throws and
+// is the ONLY place the runtime path may spawn a scanner (gated to a real skill
+// invocation lacking fresh trust). Fail-safe: if it can't scan, no clean stamp is
+// written and the gate reviews.
+export async function ensureSkillScanned(state, { command = "", cwd = "" } = {}) {
+  const skillPolicy = state?.policy?.skill ?? null;
+  const depsPolicy = state?.policy?.deps ?? null;
+  if (!skillPolicy) return;
+  if (skillPolicy.requireSignature === true) return; // strict: no local fallback
+  if (typeof _skills.auditSkillDir !== "function") return;
+  try {
+    const meta = checkSkillInvocationMeta({ command, cwd });
+    if (!meta.isSkillInvocation || !meta.skillDir) return;
+    const fileHashes = skillFileHashesSync(meta.skillDir);
+    if (!fileHashes.length) return; // unhashable identity → gate reviews
+    const key = skillIntegrityKey(fileHashes);
+    const trusted = skillPolicy.trustedSigners ?? [];
+    const dbVersion = readCachedScannerDbVersion();
+    const now = Date.now();
+    const ciStamp = [readShippedAttestation(meta.skillDir), readAttestation(key)]
+      .find((r) => r && r.key === key && verifyAttestationSignature(r, trusted));
+    if (ciStamp && isFresh(ciStamp, { maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS, currentDbVersion: dbVersion, nowMs: now })) {
+      return; // a fresh CI signature already covers it
+    }
+    const cacheRec = readAttestation(key);
+    if (cacheRec && isFresh(cacheRec, { maxAgeMs: skillPolicy.localGraceMs ?? LOCAL_GRACE_MS, currentDbVersion: dbVersion, nowMs: now })) {
+      return; // a fresh local stamp already covers it (within the 1-day grace)
+    }
+    await _skills.auditSkillDir(meta.skillDir, { skillPolicy, depsPolicy });
+  } catch {
+    // a scan failure must never throw into the decision; the gate fails safe.
+  }
+}
+
 // PostToolUse companion to checkSkillDeps' attestation gate. Records a
 // `user-approved` attestation for a skill invocation that has no fresh cert yet,
 // keyed to the skill's CURRENT file hashes — so the next unchanged run of the
@@ -773,6 +847,12 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
 export function recordSkillApproval(state, { command = "", cwd = "" } = {}) {
   const skillPolicy = state?.policy?.skill ?? null;
   if (!skillPolicy) {
+    return;
+  }
+  // In signature-required mode a locally-written user-approved cert is unsigned, so
+  // the gate would reject it anyway — writing one would be useless and misleading.
+  // Trust must come from the external signer; do not record a local approval.
+  if (skillPolicy.requireSignature === true) {
     return;
   }
   try {

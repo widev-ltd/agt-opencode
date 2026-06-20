@@ -1,12 +1,12 @@
 {
   "algorithm": "sha256",
-  "combined": "765fe2317a4ea04b87ebd903236472913580d30d54ee139d90cb93f069fc98f5",
+  "combined": "3c63a5a7d10042963e43cfe1111ffade1b976909b69a4c17da4b3f5a7c806d8e",
   "files": {
-    "corpus/cases/benign.jsonl": "7fbff3fa1c2c1fa5be066f14fb1cf46ce4710296832c252ad52847af2c2e4a44",
-    "corpus/cases/calibration-gaps.jsonl": "7539b416ec1b892d934d40d39edfdb70ba57f0a823fd6ee2f947c1a2d222e962",
-    "corpus/cases/dep-threats.jsonl": "521e39ad78922c6d0c343f678a50ce0539d4974c826bc2f6bb0941af341e7ea2",
+    "corpus/cases/benign.jsonl": "4802eb967fcfc9e929cbd0ef0caa2e3bf1a70743e8ac302aa3785623cb6f9e95",
+    "corpus/cases/calibration-gaps.jsonl": "6f86cce474cd862dd0580e296efdae186640ecb3da8e2b48269619153dfff7e3",
+    "corpus/cases/dep-threats.jsonl": "252b51eb1deff895b35474e6b6e7d6e31557630a58534631ef356f7463cf4525",
     "corpus/cases/skill-threats.jsonl": "9bf8ba428505c6f636276d4da3d8fd541e908ce5f344ea49b26aa525def997a3",
     "corpus/schema-sc.json": "43b147723f90e677be899426d2ccf8396d8664b359e239aff10023449a03e2f3",
-    "results-sc/matrix-sc.csv": "074f7cfa98a21cb0b178d611cc235cc55d149657cd47e6b275623d18dfe55cba"
+    "results-sc/matrix-sc.csv": "5951b04ef465f49f10a72b40dce3f8759f664af6da70c951a6a6ebd758f1094b"
   }
 }

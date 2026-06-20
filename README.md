@@ -144,20 +144,37 @@ The policy enables six extra layers (configure each in the policy file;
 | **Exfiltration** (`exfilPolicies`) | enforce | Session-aware: blocks an outbound request that embeds a credential value seen earlier in tool output. |
 | **Rate-limit** (`rateLimitPolicies`) | advisory | Per-session, per-tool call budgets. |
 | **Content-safety** (`contentSafetyPolicies`) | advisory | Harmful-instruction / jailbreak / credential-social-engineering scan; optional external API. |
-| **Dependency** (`dependencyPolicies`) | enforce | Supply-chain hygiene over a skill's / install command's deps — typosquat, unpinned, denied, non-registry/editable, untrusted index, npm install-scripts, license — across Python (PEP 723 inline, requirements, pyproject) and Node (package.json, lockfiles). |
+| **Dependency** (`dependencyPolicies`) | enforce | Deterministic supply-chain hygiene a CVE scanner is blind to — denied package, non-registry/editable, untrusted index (dependency-confusion), npm install-scripts — across Python (PEP 723 inline, requirements, pyproject) and Node (package.json, lockfiles). Transitive **CVE** scanning is delegated to trivy/osv (Tier-2). |
 | **Skill** (`skillPolicies`) | enforce | Governs a skill before it runs: integrity attestation, dangerous-pattern / secret / injection / capability scans, source allowlist, and the scan-once attestation that drives the transitive CVE gate. |
 
-**Skill & dependency supply-chain governance.** Tier 1 (runtime, in-process, no
-network) parses a skill's manifests (incl. PEP 723 inline) + does metadata hygiene
-+ an attestation lookup. Tier 2 (`skills audit`, off the hot path) resolves the
-**full transitive tree** (`uv`/`npm`) and runs an auto-detected scanner (trivy /
-osv-scanner / pip-audit) for CVEs, then writes a `scanned` attestation so a later
-run is a cheap cache hit. **Fail-safe guarantee:** a skill is allowed silently only
-when its deps were actually resolved transitively AND scanned clean; if they can't
-be (no resolver/scanner, resolver error, bare-import JS with no manifest) coverage
-is `unavailable` → unverified = unsafe (review/deny), never a false-clean. The
-proactive audit needs `uv`/`npm` + a scanner on `PATH`; their absence fails safe.
-Methodology + measured numbers: `experiment/supplychain/BENCHMARK.md`.
+**Skill & dependency supply-chain governance.** Before a skill runs, the layer
+resolves its **full transitive dependency tree** (`uv` for Python incl. PEP 723
+inline, `npm` for Node) and CVE-scans it (trivy / osv-scanner / pip-audit), then
+**stamps** the result. The stamp the gate trusts has **two tiers**:
+
+- **CI-signed (strong, durable).** A signer outside the agent box (CI/HSM) scans
+  and — only if it PASSES — signs the attestation with a private key the agent
+  machine never holds. The signed stamp ships alongside the skill
+  (`.agt-attestation.json`); the plugin verifies it with the trusted **public key**,
+  delivered out of band and set in `skillPolicies.trustedSigners` (PEM or file path,
+  never bundled). Unforgeable by a local attacker. A signature **is** the pass — CI
+  never signs a failing skill, so the gate does not re-judge a signed stamp. The CI
+  signer is a **separate tool** (`tools/skill-signer/sign.mjs`), run by CI, not on
+  the agent box.
+- **Local 1-day grace (weak, default).** An unsigned skill is scanned locally on
+  first use; if clean it gets a stamp valid for **1 day** (forgeable but time-boxed).
+  `skillPolicies.requireSignature: true` drops this tier (CI-signed only). Run
+  `skills audit` ahead of time to pre-stamp.
+
+**Fail-safe behavior (a guardrail, not a guarantee):** a skill is allowed silently
+only when its deps were actually resolved transitively AND scanned clean (or carry a
+valid CI signature); if they can't be (no resolver/scanner, resolver error,
+bare-import JS with no manifest) coverage is `unavailable` → unverified = unsafe
+(review/deny), never a false-clean. It catches *known* CVEs/patterns (not
+novel/zero-day); the local 1-day tier is forgeable; only the CI-signed tier resists
+a local forger. Methodology + measured numbers:
+`experiment/supplychain/BENCHMARK.md` (a self-graded regression suite, not an
+independent benchmark — see its header).
 
 OpenCode runs the plugin **resident in-process**, so the stateful extensions
 (exfil, rate-limit) keep per-session state in memory (the Claude Code seat,

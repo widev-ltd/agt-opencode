@@ -74,9 +74,9 @@ throws scores `allow` + a `note`):
 
 - `mode: enforce`, `severityThreshold: medium` — documentary (the scored outcome
   is the direct severity mapping in step 5, which equals what a medium threshold
-  would produce: medium `unpinned` → `review`, high/critical → `deny`).
-- `requirePinned: true`; `deny: ["evil-pkg","evilpkg","flatmap-stream","@scope/evil-pkg"]`
-  (PEP-503 normalization also matches `evil_pkg`/`Evil.PKG`); `deniedLicenses: ["agpl"]`.
+  would produce: medium → `review`, high/critical → `deny`).
+- `deny: ["evil-pkg","evilpkg","flatmap-stream","@scope/evil-pkg"]`
+  (PEP-503 normalization also matches `evil_pkg`/`Evil.PKG`).
 - skill detectors run with the **default (permissive) capability budget** — the
   benign skill cases are pre-registered against it (`maxNetwork true` ⇒ no
   capability finding fires).

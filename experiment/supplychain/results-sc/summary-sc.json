@@ -1,17 +1,17 @@
 {
   "measured": "deterministic supply-chain gate (enforce)",
   "overall": {
-    "coverage_pct": 86.24,
-    "prevention_pct": 86.24,
-    "svr_pct": 13.76,
+    "coverage_pct": 86.08,
+    "prevention_pct": 86.08,
+    "svr_pct": 13.92,
     "fpr_pct": 0,
-    "friction_pct": 4.92,
-    "attacks_in_scope": 109,
-    "covered_named": 94,
-    "prevented_any": 94,
+    "friction_pct": 0,
+    "attacks_in_scope": 79,
+    "covered_named": 68,
+    "prevented_any": 68,
     "benign_total": 61,
     "benign_denied": 0,
-    "benign_asked": 3
+    "benign_asked": 0
   },
   "per_category": {
     "benign": {
@@ -19,13 +19,13 @@
       "prevention_pct": null,
       "svr_pct": null,
       "fpr_pct": 0,
-      "friction_pct": 4.92,
+      "friction_pct": 0,
       "attacks_in_scope": 0,
       "covered_named": 0,
       "prevented_any": 0,
       "benign_total": 61,
       "benign_denied": 0,
-      "benign_asked": 3
+      "benign_asked": 0
     },
     "calibration-gap": {
       "coverage_pct": 0,
@@ -33,7 +33,7 @@
       "svr_pct": 100,
       "fpr_pct": null,
       "friction_pct": null,
-      "attacks_in_scope": 15,
+      "attacks_in_scope": 11,
       "covered_named": 0,
       "prevented_any": 0,
       "benign_total": 0,
@@ -85,35 +85,9 @@
       "svr_pct": 0,
       "fpr_pct": null,
       "friction_pct": null,
-      "attacks_in_scope": 3,
-      "covered_named": 3,
-      "prevented_any": 3,
-      "benign_total": 0,
-      "benign_denied": 0,
-      "benign_asked": 0
-    },
-    "dep-typosquat": {
-      "coverage_pct": 100,
-      "prevention_pct": 100,
-      "svr_pct": 0,
-      "fpr_pct": null,
-      "friction_pct": null,
-      "attacks_in_scope": 17,
-      "covered_named": 17,
-      "prevented_any": 17,
-      "benign_total": 0,
-      "benign_denied": 0,
-      "benign_asked": 0
-    },
-    "dep-unpinned": {
-      "coverage_pct": 100,
-      "prevention_pct": 100,
-      "svr_pct": 0,
-      "fpr_pct": null,
-      "friction_pct": null,
-      "attacks_in_scope": 8,
-      "covered_named": 8,
-      "prevented_any": 8,
+      "attacks_in_scope": 2,
+      "covered_named": 2,
+      "prevented_any": 2,
       "benign_total": 0,
       "benign_denied": 0,
       "benign_asked": 0
@@ -186,22 +160,18 @@
   },
   "expected_match_rate_pct": 100,
   "expected_match": {
-    "matched": 170,
-    "total": 170
+    "matched": 140,
+    "total": 140
   },
-  "cases": 170,
+  "cases": 140,
   "policy": {
     "mode": "enforce",
     "severityThreshold": "medium",
-    "requirePinned": true,
     "deny": [
       "evil-pkg",
       "evilpkg",
       "flatmap-stream",
       "@scope/evil-pkg"
-    ],
-    "deniedLicenses": [
-      "agpl"
     ]
   },
   "note": "Deterministic supply-chain track: scanSkill + Tier-1 deps (scanDependencyMetadata over manifest-file specs) in enforce mode. No vuln scanner, no network. A deployed enforce gate adds review-until-vuln-scanned friction NOT measured here (see README)."

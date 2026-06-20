@@ -47,7 +47,7 @@ import { createHash } from "node:crypto";
 import { open, readdir, readlink, realpath, stat } from "node:fs/promises";
 import {
   closeSync, openSync, readdirSync, readlinkSync, readSync,
-  realpathSync, statSync,
+  realpathSync, statSync, readFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -82,6 +82,12 @@ const SCRIPT_EXTENSIONS = new Set([
 ]);
 
 const SKILL_MANIFEST_NAMES = new Set(["skill.md", "skill.yaml", "skill.yml", "skill.json"]);
+
+// The CI-signed attestation that ships ALONGSIDE a skill lives in the skill dir but
+// is NOT skill content — it must be EXCLUDED from the integrity hash, or writing it
+// would change the skill's key and break the very binding it carries. Keep in sync
+// with attestation.readShippedAttestation's filename list.
+const SHIPPED_ATTESTATION_NAMES = new Set([".agt-attestation.json", "agt-attestation.json"]);
 
 // ── Dangerous script patterns (ReDoS-safe; bounded quantifiers only) ─────────
 // Each: { id, severity, source, flags }. Severity drives the finding only — the
@@ -473,10 +479,39 @@ export function compileSkillPolicy(raw) {
   const severityThreshold =
     raw.severityThreshold != null ? normalizeSeverity(raw.severityThreshold) : undefined;
 
+  // External-signer trust (opt-in). `trustedSigners` is a list of Ed25519 public
+  // keys the runtime gate accepts on an attestation. Each entry is EITHER an inline
+  // PEM public key OR a FILE PATH to one (the key is delivered out of band — never
+  // bundled in the plugin — and the policy points here). Paths are read at load;
+  // an unreadable/non-PEM entry is dropped so a typo can't silently weaken trust.
+  // When ANY trusted key is present (or requireSignature is explicitly true), the
+  // gate requires a valid signature from one of them before trusting a CI stamp.
+  const trustedSigners = (Array.isArray(raw.trustedSigners) ? raw.trustedSigners : [])
+    .map((s) => String(s ?? ""))
+    .map((s) => {
+      if (s.includes("-----BEGIN PUBLIC KEY-----")) return s; // inline PEM
+      try {
+        const txt = readFileSync(s, "utf8");
+        return txt.includes("-----BEGIN PUBLIC KEY-----") ? txt : "";
+      } catch {
+        return ""; // unreadable path → dropped (fail safe: fewer trusted keys)
+      }
+    })
+    .filter(Boolean);
+  // STRICT mode (explicit opt-in): when true, an unsigned skill is BLOCKED — no
+  // local-scan fallback. Default false: unsigned skills get a local scan + a
+  // 1-day grace stamp, while CI-signed skills (trustedSigners) get durable trust.
+  const requireSignature = raw.requireSignature === true;
+  // Optional override of the unsigned/local-scan grace window (default 1 day).
+  const localGraceMs = Number.isFinite(raw.localGraceMs) ? Number(raw.localGraceMs) : undefined;
+
   return {
     mode,
     maxAgeMs,
     severityThreshold,
+    trustedSigners,
+    requireSignature,
+    localGraceMs,
     allowedSources: Array.isArray(raw.allowedSources)
       ? raw.allowedSources.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
       : [],
@@ -601,6 +636,8 @@ export async function scanSkill(skillDir, skillPolicy, opts = {}) {
     const relPath = safeRelative(root, absPath);
     const lower = relPath.toLowerCase();
     const baseName = lower.split(/[\\/]/).pop() ?? lower;
+    // The shipped CI attestation is metadata, not skill content: never hash or scan it.
+    if (SHIPPED_ATTESTATION_NAMES.has(baseName)) continue;
     const isSkillManifest = SKILL_MANIFEST_NAMES.has(baseName);
     const ext = baseName.includes(".") ? baseName.slice(baseName.lastIndexOf(".")) : "";
     const isScript = SCRIPT_EXTENSIONS.has(ext);
@@ -1453,6 +1490,8 @@ export function skillFileHashesSync(skillDir) {
           continue;
         }
         stack.push({ dir: full, depth: depth + 1 });
+      } else if (SHIPPED_ATTESTATION_NAMES.has(entry.name)) {
+        continue; // the shipped CI attestation is excluded from the integrity hash
       } else if (entry.isFile()) {
         const info = hashFileWholeSync(full);
         if (info != null) {
