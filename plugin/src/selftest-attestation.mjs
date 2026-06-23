@@ -6,6 +6,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import {
   RECORD_SCHEMA,
   DEFAULT_MAX_AGE_MS,
@@ -17,6 +18,9 @@ import {
   writeAttestation,
   isFresh,
   decideFromFindings,
+  signAttestationRecord,
+  verifyAttestationSignature,
+  canonicalizeForSignature,
 } from "./attestation.mjs";
 
 let fail = 0;
@@ -266,6 +270,59 @@ ok("FAILSAFE: user-approved + 0 findings → allow (explicit override, coverage 
 // only difference is an explicit operator override, never a false-clean scan.
 ok("FAILSAFE: same empty cert as 'scanned'/unavailable is review (no silent-allow without override)",
   decideFromFindings({ basis: "scanned", rawFindings: [], scanCoverage: "unavailable" }, enforceHigh).effect === "review");
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SIGNATURE HARDENING — embedded keyId / notBefore / notAfter are part of the
+//  SIGNED payload (canonicalizeForSignature strips ONLY {sig,signer}), so they
+//  are tamper-proof: mutate any of them post-signing and verification must fail.
+// ════════════════════════════════════════════════════════════════════════════
+{
+  const kp = generateKeyPairSync("ed25519");
+  const pub = kp.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const priv = kp.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const baseRec = { basis: "scanned", scanCoverage: "transitive", rawFindings: [], key: "abc", timestampMs: now };
+
+  // sign with opts → the metadata lands in the record and verifies.
+  const future = now + 60 * 60 * 1000;
+  const past = now - 60 * 60 * 1000;
+  const signed = signAttestationRecord(baseRec, priv, "ci", { keyId: "ci-key-1", notBefore: past, notAfter: future });
+  ok("sign: keyId embedded in the signed record", signed.keyId === "ci-key-1");
+  ok("sign: notBefore embedded in the signed record", signed.notBefore === past);
+  ok("sign: notAfter embedded in the signed record", signed.notAfter === future);
+  ok("sign: signer envelope set to the given id", signed.signer === "ci");
+  ok("sign+verify: a freshly signed record verifies under the trusted key",
+    verifyAttestationSignature(signed, [pub]) === true);
+
+  // canonicalize strips ONLY {sig,signer} — keyId/notBefore/notAfter are covered.
+  const canon = canonicalizeForSignature(signed);
+  ok("canon: keyId is inside the signed payload (covered by signature)", /"keyId":"ci-key-1"/.test(canon));
+  ok("canon: notAfter is inside the signed payload (covered by signature)", new RegExp(`"notAfter":${future}`).test(canon));
+  ok("canon: sig/signer are NOT in the canonical payload (still the only strip)",
+    !/"sig":/.test(canon) && !/"signer":/.test(canon));
+
+  // TAMPER: mutate notAfter post-signing → signature must fail (the whole point).
+  const tamperedAfter = { ...signed, notAfter: future + 10 * 365 * 24 * 3600 * 1000 };
+  ok("tamper: mutating notAfter after signing → verify FAILS",
+    verifyAttestationSignature(tamperedAfter, [pub]) === false);
+  // TAMPER: mutate notBefore post-signing → signature must fail.
+  const tamperedBefore = { ...signed, notBefore: now - 10 * 365 * 24 * 3600 * 1000 };
+  ok("tamper: mutating notBefore after signing → verify FAILS",
+    verifyAttestationSignature(tamperedBefore, [pub]) === false);
+  // TAMPER: mutate keyId post-signing → signature must fail.
+  const tamperedKeyId = { ...signed, keyId: "ci-key-evil" };
+  ok("tamper: mutating keyId after signing → verify FAILS",
+    verifyAttestationSignature(tamperedKeyId, [pub]) === false);
+
+  // opts omitted / non-finite → fields are NOT added (no bogus value in the payload).
+  const noOpts = signAttestationRecord(baseRec, priv, "ci");
+  ok("sign: omitted opts → no keyId/notBefore/notAfter fields added",
+    !("keyId" in noOpts) && !("notBefore" in noOpts) && !("notAfter" in noOpts));
+  const badOpts = signAttestationRecord(baseRec, priv, "ci", { keyId: "", notBefore: NaN, notAfter: "soon" });
+  ok("sign: empty/NaN/non-number opts are dropped (no bogus embedded values)",
+    !("keyId" in badOpts) && !("notBefore" in badOpts) && !("notAfter" in badOpts));
+  ok("sign: record signed with no opts still verifies",
+    verifyAttestationSignature(noOpts, [pub]) === true);
+}
 
 console.log(`\n${fail === 0 ? "ALL PASS" : fail + " FAILED"}`);
 process.exit(fail === 0 ? 0 : 1);

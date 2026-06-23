@@ -6,9 +6,11 @@
 // When the agent runs `pip install`, `uv run script.py`, `npm install`, or just
 // works inside a repo with a manifest, it can pull arbitrary code from a public
 // index into the host. That is the dominant supply-chain risk for an autonomous
-// coding agent: typosquats, unpinned floating versions, packages fetched from a
-// git URL or a private index the operator never approved, and packages whose
-// install scripts run code at install time. This module governs that surface in
+// coding agent. This module governs the parts a CVE scanner is blind to — packages
+// fetched from a git URL or a private index the operator never approved, packages
+// whose install scripts run code at install time, and an operator deny-list — plus
+// the transitive CVE scan (Tier-2, delegated to trivy/osv/pip-audit). It governs
+// that surface in
 // two tiers:
 //
 //   TIER 1 (sync, runtime-safe): parse the manifests / install command, then run
@@ -40,9 +42,10 @@
 //   depsPolicies.mode = "advisory"  → findings surfaced as context, no deny
 //   depsPolicies.mode = "enforce"   → severity ≥ threshold maps to deny/review
 //
-// The Tier-2 scanner result can be folded into an attestation by attestation.mjs;
-// this module exposes a thin integration helper (attestDepsScan) that imports it
-// lazily so deps.mjs has no hard dependency on attestation at load time.
+// The Tier-2 scanner result is folded into an attestation by skills.auditSkillDir,
+// which calls resolveAndScan here for the HONEST coverage verdict (transitive /
+// declared-only / unavailable) and owns the attestation write. deps.mjs keeps no
+// load-time dependency on attestation.mjs.
 
 import { statSync, openSync, readSync, closeSync, readFileSync, readdirSync, mkdtempSync, writeFileSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -401,7 +404,7 @@ function parsePackageJson(text) {
     if (!deps || typeof deps !== "object") continue;
     for (const [name, range] of Object.entries(deps)) {
       // An `npm:realpkg@ver` range is an alias; the REAL package is the target,
-      // so check that (deny/typosquat/non-registry) rather than the alias key.
+      // so check that (deny/non-registry) rather than the alias key.
       const aliasTarget = npmAliasTarget(range);
       out.push(aliasTarget
         ? { ecosystem: "npm", name: aliasTarget, spec: `${name}@${range}`, source: `package.json:${field}`, aliasOf: String(name) }
@@ -482,7 +485,7 @@ function canonicalSpec(ecosystem, raw, source) {
   }
   // npm alias: `alias@npm:realpkg@ver` (command form) or a package.json range of
   // `npm:realpkg@ver`. The REAL fetched package is the aliased target, so deny /
-  // typosquat / non-registry checks must run against it, not the harmless alias.
+  // non-registry checks must run against it, not the harmless alias.
   const range = npmRange(token);
   const aliasTarget = npmAliasTarget(range);
   if (aliasTarget) {
@@ -904,6 +907,11 @@ async function probeResolver(name, versionArgs) {
 export async function resolveTransitive(specs, { cwd = "", manifests = null, timeoutMs = 120000 } = {}) {
   const declared = Array.isArray(specs) ? specs.slice(0, MAX_SPECS) : [];
   try {
+    // Declared with `let` at the top of the try (not `var` inside the if-blocks):
+    // these are read later in the fail-safe note. `var` worked only via function
+    // hoisting — a `var→let` modernization or block extraction would have turned the
+    // later reads into a ReferenceError. Make the lexical scope explicit and correct.
+    let pyNote, nodeNote;
     // Resolve Python first (uv), then Node (npm). The first resolver with a usable
     // manifest AND a runnable tool AND a successful resolve wins.
     const pyManifest = detectPythonManifest(cwd, manifests);
@@ -916,7 +924,7 @@ export async function resolveTransitive(specs, { cwd = "", manifests = null, tim
       }
       // uv present but resolve failed → fall through; a Node manifest may resolve,
       // otherwise we fail safe below (never claim transitive for the Python set).
-      var pyNote = r.note;
+      pyNote = r.note;
     }
 
     const nodeManifest = detectNodeManifest(cwd, manifests);
@@ -927,7 +935,7 @@ export async function resolveTransitive(specs, { cwd = "", manifests = null, tim
         return { resolved: resolved.length ? resolved : declared, coverage: "transitive",
           scanDir: r.scanDir, method: "npm", fromLockfile: true, note: r.note };
       }
-      var nodeNote = r.note;
+      nodeNote = r.note;
     }
 
     // No resolver produced a transitive tree. If a manifest exists but resolution
@@ -1391,58 +1399,6 @@ function mapSeverity(s) {
   if (v.includes("MED") || v.includes("MODERATE")) return "medium";
   if (v.includes("LOW")) return "low";
   return "medium";
-}
-
-// ── attestation integration helper ──────────────────────────────────────────
-
-/**
- * Run the Tier-2 scanner and fold its result into an attestation via the sibling
- * attestation.mjs module, imported LAZILY so deps.mjs has no load-time dependency
- * on it (and so the selftest exercises pure functions without attestation present).
- * Never throws — returns the scan result augmented with an `attestation` field, or
- * the raw scan result with `attestationError` if attestation.mjs is unavailable.
- */
-export async function attestDepsScan(resolvedSpecs, opts = {}) {
-  // Resolve + scan via the honest one-step entry so the attestation carries the
-  // REAL coverage (transitive / declared-only / unavailable) rather than assuming
-  // a bare scan covered the transitive tree.
-  const scan = await resolveAndScan({
-    cwd: opts.cwd ?? "",
-    manifests: opts.manifests ?? null,
-    specs: Array.isArray(resolvedSpecs) ? resolvedSpecs : (opts.specs ?? null),
-    scannerCmd: opts.scannerCmd ?? null,
-    timeoutMs: opts.timeoutMs ?? 120000,
-  });
-  try {
-    const att = await import("./attestation.mjs");
-    // attestation.decideFromFindings expects a RECORD ({rawFindings, basis,
-    // scanCoverage, …}) plus a policy — NOT a bare findings array. Building the
-    // record correctly is what lets the coverage-aware "scanned-but-partial → don't
-    // silent-allow" logic fire. Carry the scan's coverage through so an unavailable
-    // / declared-only scan is not treated as a clean full scan.
-    const record = {
-      rawFindings: Array.isArray(scan.findings) ? scan.findings : [],
-      // basis stays "scanned"; the HONESTY about whether the scan actually covered
-      // the set is carried by scanCoverage, which decideFromFindings inspects so an
-      // unavailable/partial scan with zero findings is reviewed, not silent-allowed.
-      basis: "scanned",
-      // Coverage vocabulary is transitive | declared-only | unavailable. Never
-      // synthesize a clean "full" — an absent coverage means we did NOT verify.
-      scanCoverage: scan.coverage ?? "unavailable",
-      scanner: scan.scanner ?? null,
-      dbVersion: scan.dbVersion ?? null,
-    };
-    const policy = opts.policy ?? null;
-    if (typeof att.attestFromFindings === "function") {
-      return { ...scan, attestation: att.attestFromFindings(record, policy) };
-    }
-    if (typeof att.decideFromFindings === "function") {
-      return { ...scan, attestation: att.decideFromFindings(record, policy) };
-    }
-    return { ...scan, attestationError: "attestation.mjs is present but exposes no known attestation entry point." };
-  } catch (e) {
-    return { ...scan, attestationError: `attestation.mjs unavailable: ${String(e?.message ?? e)}` };
-  }
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────

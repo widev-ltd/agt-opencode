@@ -1,0 +1,83 @@
+# CI for agt-opencode (the OpenCode plugin: a single-file bundle built from
+# plugin/src by build.mjs, plus an installer CLI).
+#
+# Gates:
+#   1. npm ci && npm test — installs deps, then `npm test` runs `node build.mjs`
+#      followed by `node --test test/*.test.mjs`. The bundle smoke tests
+#      (test/bundle.test.mjs) assert a FRESHLY BUILT bundle exports the plugin,
+#      carries every governance extension marker, and enforces a real .env deny —
+#      i.e. the shipped artifact matches source.
+#   2. bundle freshness — prove build.mjs deterministically reproduces the bundle
+#      from plugin/src. See the long comment on that step for why this is a
+#      rebuild+hash check and NOT `git diff` (the bundle is gitignored).
+#   3. doctor — install into a throwaway --opencode-home and confirm `doctor`
+#      reports a healthy managed install (exit 0).
+#
+# package.json engines requires node >=22, so CI runs on Node 22 only.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # engines.node is ">=22.0.0"; build.mjs targets node22.
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 1) Install + test. `npm test` = `node build.mjs && node --test test/*.test.mjs`.
+      #    The build step regenerates assets/agt-governance.js from plugin/src, so
+      #    the bundle smoke tests run against a fresh artifact (guards the
+      #    stale-bundle eval finding).
+      - name: Install and test
+        run: |
+          npm ci
+          npm test
+
+      # 2) Bundle freshness. The shipped bundle assets/agt-governance.js is
+      #    GITIGNORED (it is a build-on-pack artifact), so `git diff --exit-code`
+      #    on it is a no-op and would be a false-green gate. Instead we prove the
+      #    bundle is the DETERMINISTIC output of build.mjs over the current
+      #    plugin/src: build, snapshot the hash, build again, and require the two
+      #    hashes to match. Combined with the npm-test freshness markers, this is
+      #    the authoritative "bundle matches source" guarantee for a gitignored
+      #    artifact. esbuild output is byte-stable, so a drift here means a
+      #    nondeterministic or broken build.
+      - name: Bundle freshness (deterministic rebuild)
+        run: |
+          node build.mjs
+          h1="$(sha256sum assets/agt-governance.js | cut -d' ' -f1)"
+          node build.mjs
+          h2="$(sha256sum assets/agt-governance.js | cut -d' ' -f1)"
+          echo "build #1: $h1"
+          echo "build #2: $h2"
+          if [ "$h1" != "$h2" ]; then
+            echo "::error::build.mjs is not reproducible — bundle hash changed between two builds"
+            exit 1
+          fi
+          echo "Bundle is the deterministic output of build.mjs over plugin/src."
+
+      # 3) Installer doctor against a throwaway OpenCode home. `doctor` on an empty
+      #    home reports "plugin not installed" and exits 1, so we install first
+      #    (which copies the freshly built bundle and seeds a policy), THEN run
+      #    doctor and require a clean exit 0. (The "opencode not on PATH" notice is
+      #    a warning, not an error, and does not fail doctor.)
+      - name: Installer doctor (temp --opencode-home)
+        run: |
+          HOME_DIR="$(mktemp -d)"
+          node bin/agt-opencode.mjs install --opencode-home "$HOME_DIR"
+          node bin/agt-opencode.mjs doctor  --opencode-home "$HOME_DIR"

@@ -156,12 +156,15 @@ The numbers above are self-graded. These signals are *not* (or are owed):
   (process-per-hook): ~244 ms/hook ordinary (≈106 ms is Node startup, ~138 ms the
   SDK+engine load); a skill invocation adds the local scan (seconds on first use,
   then a cache hit). Harness: `experiment/harness/overhead.mjs`.
-- **Forgery-resistance of the trust stamp (a real cryptographic property, proven —
+- **Forgery-resistance of the trust stamp (a real cryptographic property, tested —
   not a corpus metric).** With external signing configured, a stamp not signed by
   the trusted (off-box) key is rejected: a local attacker cannot forge a clean
-  "pass." Demonstrated in `experiment/signing-sim/` and the gate selftests
-  (CI-signed → allow; unsigned/attacker-signed/tampered → not trusted). The
-  unsigned local tier is deliberately weak (1-day grace, forgeable).
+  "pass." The authoritative test is `scripts/selftest-skill-gate.mjs` (CI-signed →
+  allow; unsigned / attacker-signed / tampered → not trusted; strict mode; DB-binding
+  freshness) — it drives the real gate. `experiment/signing-sim/` is an illustrative
+  end-to-end demo of the same property (it warns and exits non-zero if no scanner is
+  present, so it can't silently produce a vacuous "tamper" arm). The unsigned local
+  tier is deliberately weak (1-day grace, forgeable).
 - **STILL OWED (the honest gap).** There is no independent third-party attack
   corpus and no *measured* host-platform baseline (what native settings block
   without the plugin). Until those exist, the headline numbers remain a self-graded

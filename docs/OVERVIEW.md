@@ -64,6 +64,13 @@ prompt / tool call ──► AGT policy engine ──► allow / review / deny �
   `tool.execute.before` gate fails closed (denies). That is safe but blunt —
   see [CONFIGURATION.md](CONFIGURATION.md) for how the `balanced` default and
   the `advisory` profile work around it.
+- **Cross-seat note (if you also run the Claude Code seat).** The two seats
+  resolve a `review` decision **differently**: this OpenCode seat **denies**
+  headless (above), whereas the Claude Code companion renders `review` as an
+  interactive **ask** prompt that you can approve. The same policy is therefore
+  *blunter here* — a `review`-tier tool that you could approve-and-run under
+  Claude Code is blocked outright under OpenCode. Use `advisory` or widen
+  `allowedTools` if that is too strict for your workflow.
 - **The audit log is tamper-evident, not tamper-proof.** The hash chain detects
   edits/insertions/reordering and tail-truncation, but it is keyless: anyone who
   can write the log file can recompute a valid chain. Treat it as an integrity

@@ -144,6 +144,7 @@ The policy enables six extra layers (configure each in the policy file;
 | **Exfiltration** (`exfilPolicies`) | enforce | Session-aware: blocks an outbound request that embeds a credential value seen earlier in tool output. |
 | **Rate-limit** (`rateLimitPolicies`) | advisory | Per-session, per-tool call budgets. |
 | **Content-safety** (`contentSafetyPolicies`) | advisory | Harmful-instruction / jailbreak / credential-social-engineering scan; optional external API. |
+| **Intent judge** (`intentJudgePolicies`) | **disabled** | Optional LLM-as-judge: assesses the *intent* of a tool call (benign/suspicious/malicious). Additive-only (raises to review/deny, never downgrades); fail-safe to deterministic. Off by default — see [docs/LLM-JUDGE.md](docs/LLM-JUDGE.md). |
 | **Dependency** (`dependencyPolicies`) | enforce | Deterministic supply-chain hygiene a CVE scanner is blind to — denied package, non-registry/editable, untrusted index (dependency-confusion), npm install-scripts — across Python (PEP 723 inline, requirements, pyproject) and Node (package.json, lockfiles). Transitive **CVE** scanning is delegated to trivy/osv (Tier-2). |
 | **Skill** (`skillPolicies`) | enforce | Governs a skill before it runs: integrity attestation, dangerous-pattern / secret / injection / capability scans, source allowlist, and the scan-once attestation that drives the transitive CVE gate. |
 

@@ -27,12 +27,18 @@ const ENGINE = [
   ?? join(here, "..", "..", "plugins", "agt-governance", "scripts");
 
 function parseArgs(argv) {
-  const out = { skillDir: null, key: null, threshold: "high", outPath: null };
+  const out = { skillDir: null, key: null, threshold: "high", outPath: null, keyId: null, validDays: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--key") out.key = argv[++i];
     else if (a === "--threshold") out.threshold = argv[++i];
     else if (a === "--out") out.outPath = argv[++i];
+    // --key-id stamps a signer id INTO the signed payload so a compromised key can
+    // be revoked by id (skillPolicies.revokedKeyIds) without re-distributing keys.
+    else if (a === "--key-id") out.keyId = argv[++i];
+    // --valid-days N embeds notBefore=now / notAfter=now+N*86400s in the signed
+    // payload; the gate rejects the stamp past notAfter even within its max-age.
+    else if (a === "--valid-days") out.validDays = Number(argv[++i]);
     else if (a === "-h" || a === "--help") out.help = true;
     else out.skillDir = a;
   }
@@ -41,7 +47,7 @@ function parseArgs(argv) {
 
 const args = parseArgs(process.argv.slice(2));
 if (args.help || !args.skillDir || !args.key) {
-  console.error("usage: node sign.mjs <skillDir> --key <ci-private.pem> [--threshold low|medium|high|critical] [--out <path>]");
+  console.error("usage: node sign.mjs <skillDir> --key <ci-private.pem> [--threshold low|medium|high|critical] [--out <path>] [--key-id <id>] [--valid-days <N>]");
   process.exit(2);
 }
 
@@ -78,10 +84,20 @@ if (decision.effect !== "allow") {
   process.exit(1);
 }
 
-const signed = att.signAttestationRecord(record, readFileSync(args.key, "utf8"), "ci");
+// Optional key id + validity window, embedded INTO the signed payload (so they
+// can't be tampered post-signing and enable id-based revocation / self-expiry).
+const signOpts = {};
+if (args.keyId) signOpts.keyId = String(args.keyId);
+if (Number.isFinite(args.validDays) && args.validDays > 0) {
+  const now = Date.now();
+  signOpts.notBefore = now;
+  signOpts.notAfter = now + args.validDays * 24 * 3600 * 1000;
+}
+const signed = att.signAttestationRecord(record, readFileSync(args.key, "utf8"), "ci", signOpts);
 const outPath = args.outPath ? resolve(args.outPath) : join(skillDir, ".agt-attestation.json");
 writeFileSync(outPath, `${JSON.stringify(signed, null, 2)}\n`);
 console.log(`SIGNED (pass): ${skillDir}`);
-console.log(`  coverage=${record.scanCoverage}  scanner=${summary.scanner}  key=${summary.key.slice(0, 16)}…`);
+console.log(`  coverage=${record.scanCoverage}  scanner=${summary.scanner}  key=${summary.key.slice(0, 16)}…`
+  + `${signOpts.keyId ? `  keyId=${signOpts.keyId}` : ""}${signOpts.notAfter ? `  notAfter=${new Date(signOpts.notAfter).toISOString().slice(0, 10)}` : ""}`);
 console.log(`  -> ${outPath}  (verify with the matching public key on the agent)`);
 process.exit(0);

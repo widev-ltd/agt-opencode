@@ -396,7 +396,7 @@
   "dependencyPolicies": {
     "enabled": true,
     "mode": "advisory",
-    "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). Advisory mode surfaces typosquats, unpinned/non-registry deps, untrusted indexes, and npm install-scripts as context. Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
+    "_note": "Tier-1 dependency/supply-chain hygiene for skill and install commands (pip/uv/uvx/npm, PEP 723, requirements/pyproject/lockfiles). Advisory mode surfaces non-registry deps, untrusted indexes, and npm install-scripts as context (deterministic checks a CVE scanner is blind to; typosquat/unpinned/license detection was removed). Set mode to 'enforce' to deny at/above severityThreshold. Tier-2 (transitive CVE scan via trivy/osv-scanner/pip-audit) runs offline through `skills audit`, never on the tool-call path.",
     "severityThreshold": "high",
     "allow": [],
     "deny": [],

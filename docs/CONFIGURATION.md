@@ -2,7 +2,7 @@
 
 ## Profiles
 
-Three policy profiles ship under `config/profiles/`. They share the same
+Four policy profiles ship under `config/profiles/`. They share the same
 dangerous-command/credential deny rules and the same scanning; they differ in
 which tools are allowed vs reviewed and whether enforcement blocks at all.
 
@@ -10,12 +10,15 @@ which tools are allowed vs reviewed and whether enforcement blocks at all.
 |---|---|---|---|---|
 | **strict** | enforce | `read` `glob` `grep` `list` | everything else (write, edit, bash, web, task) | Maximum lock-down. Expect the agent to be unable to write/run until you widen `allowedTools`. |
 | **balanced** *(default)* | enforce | `read` `glob` `grep` `list` `write` `edit` `apply_patch` `todowrite` | `bash` `webfetch` `websearch` `task` | Normal use — the agent can do the read/write/edit loop; shell/web are gated. |
+| **secure-low-friction** *(recommended)* | enforce | the everyday tools — `read` `glob` `grep` `list` `todowrite` `write` `edit` `apply_patch` `bash` `webfetch` `websearch` | only `task` (subagent spawning) | You want security without the prompting/blocking: the named threat rules + exfil/DLP/content-safety still enforce, but `bash`/web aren't reviewed (so not denied), so the agent works freely. |
 | **advisory** | advisory | — (never blocks) | — (only warns) | First rollout / observation. Surfaces findings without blocking anything. |
 
 > Because of OpenCode's review→deny behaviour (see
 > [USAGE.md](USAGE.md#the-reviewdeny-behaviour-important)), "reviewed" tools are
 > currently **blocked**, not interactively approved. `balanced` is the default
-> because it keeps the core editing loop working anyway.
+> because it keeps the core editing loop working anyway; **`secure-low-friction`**
+> is the recommended step up when review→deny is too blunt — it keeps the threat
+> rules but stops sending `bash`/web to review (so they aren't denied).
 
 Apply a profile (then restart OpenCode):
 
@@ -56,6 +59,7 @@ A policy is a JSON document (`schemaVersion: 1`). The key fields:
   "exfilPolicies":        { "mode": "enforce",  /* session-aware secret-reuse tripwire */ },
   "rateLimitPolicies":    { "mode": "advisory", /* per-session, per-tool call budgets */ },
   "contentSafetyPolicies":{ "mode": "advisory", /* harmful-instruction / jailbreak scan */ },
+  "intentJudgePolicies":  { "enabled": false,   /* OPTIONAL LLM-as-judge intent detection — off by default; see LLM-JUDGE.md */ },
   "dependencyPolicies":   { "mode": "enforce",  /* supply-chain dep hygiene — see below */ },
   "skillPolicies":        { "mode": "enforce",  /* skill gating + attestation — see below */ }
 }
@@ -98,6 +102,7 @@ default to **enforce**.
 | Exfiltration | `exfilPolicies` | enforce | Session-aware: blocks an outbound request embedding a credential value seen earlier in tool output. |
 | Rate-limit | `rateLimitPolicies` | advisory | Per-session, per-tool call budgets. |
 | Content-safety | `contentSafetyPolicies` | advisory | Harmful-instruction / jailbreak / credential-social-engineering scan; optional external API. |
+| Intent judge | `intentJudgePolicies` | **disabled** | Optional LLM-as-judge for tool-call *intent* (benign/suspicious/malicious). Additive-only, fail-safe to deterministic. Off by default — see [LLM-JUDGE.md](LLM-JUDGE.md). |
 | Dependency | `dependencyPolicies` | enforce | Supply-chain hygiene over a skill's / install command's deps. |
 | Skill | `skillPolicies` | enforce | Governs a skill before it runs: integrity attestation + scans. |
 
@@ -120,7 +125,7 @@ They work in two tiers:
   tree** (`uv` / `npm`) and runs an auto-detected CVE scanner (`trivy` /
   `osv-scanner` / `pip-audit`), then writes a `scanned` attestation so a later
   runtime gate is a cheap cache hit. See
-  [USAGE.md](USAGE.md#auditing-skills-ahead-of-use).
+  [USAGE.md](USAGE.md#trusting-skills--two-tiers).
 
 Useful keys (both accept `mode` and merge over the shipped defaults):
 
@@ -140,20 +145,30 @@ Useful keys (both accept `mode` and merge over the shipped defaults):
   },
   "severityThreshold": "high",           // min finding severity that escalates (default high)
   "trustedSigners": ["/etc/agt/ci-public.pem"],  // CI public key(s): PEM or file path (delivered out of band)
-  "requireSignature": false,             // true = STRICT: only CI-signed skills run (no 1-day local fallback)
-  "maxAgeMs": 604800000,                 // CI-signed stamp window (default 7 days)
+  // requireSignature DEFAULTS to true when trustedSigners is set (no silent fallback
+  // to the forgeable local tier). Set false to keep the 1-day local scan alongside it.
+  "requireSignature": true,
+  "revokedKeyIds": [],                    // revoke a compromised signer by its --key-id
+  "revokedAttestationKeys": [],           // surgically revoke individual attestations by integrity key
+  "maxAgeMs": 604800000,                 // CI-signed stamp window (default 7 days; an embedded notAfter, if tighter, wins)
   "localGraceMs": 86400000               // unsigned local-scan stamp window (default 1 day)
 }
 ```
 
-> **Two trust tiers.** A **CI-signed** stamp (verified against `trustedSigners`, a
-> public key you deliver out of band) is trusted for `maxAgeMs` — unforgeable by a
-> local attacker, because the private key lives in CI/HSM, off the agent box. A
-> signature **is** the pass: CI signs only skills that scanned clean, so the gate
-> does not re-judge a signed stamp. An **unsigned** skill is scanned locally and
-> gets a 1-day (`localGraceMs`) stamp — forgeable but time-boxed. `requireSignature:
-> true` drops the local tier (CI-signed only). The CI signer is a separate tool
-> (`tools/skill-signer/sign.mjs`), run by CI. See [USAGE.md](USAGE.md#auditing-skills-ahead-of-use).
+> **Two trust tiers (hardened).** A **CI-signed** stamp is honored only if it
+> verifies under a `trustedSigners` key, is bound to the skill's current files, is
+> within its validity window (embedded `notAfter`, or `maxAgeMs`, whichever is
+> tighter), and its `keyId`/integrity-key is not in the revocation lists —
+> unforgeable by a local attacker (the private key lives in CI/HSM, off the agent
+> box). A signature **is** the pass: CI signs only skills that scanned clean. A
+> revoked/expired/unverifiable stamp is treated as untrusted (review/deny), never
+> allow. **`requireSignature` defaults to true when `trustedSigners` is set** (no
+> silent fallback to the forgeable local tier); set it false to keep the 1-day
+> (`localGraceMs`) local scan. An **unsigned** skill (no trusted signers) is scanned
+> locally and gets the 1-day stamp — forgeable but time-boxed. The CI signer is a
+> separate tool (`tools/skill-signer/sign.mjs --key-id <id> --valid-days <N>`), run
+> by CI; revoke by adding the id to `revokedKeyIds`. Runbook:
+> `tools/skill-signer/KEY-MANAGEMENT.md`. See [USAGE.md](USAGE.md#trusting-skills--two-tiers).
 
 > **Capability least-privilege.** A skill declares what it may do in its
 > `SKILL.md` frontmatter (`allowed-capabilities: [network, subprocess, …]`). A

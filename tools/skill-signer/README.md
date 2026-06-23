@@ -40,10 +40,19 @@ doesn't pass (the signer exits non-zero, so no `.agt-attestation.json` is writte
 
 ```bash
 for skill in skills/*/; do
-  node tools/skill-signer/sign.mjs "$skill" --key "$CI_PRIVATE_KEY" --threshold high || exit 1
+  node tools/skill-signer/sign.mjs "$skill" --key "$CI_PRIVATE_KEY" --threshold high \
+    --key-id "$SIGNER_KEY_ID" --valid-days 7 || exit 1
 done
 # commit/publish each skill's .agt-attestation.json ALONGSIDE the skill
 ```
+
+`--key-id <id>` embeds a signer id **inside the signed payload** so a compromised
+key can be revoked by id (`skillPolicies.revokedKeyIds`) without re-distributing
+keys; `--valid-days N` embeds a `notBefore`/`notAfter` window so the stamp self-
+expires (the gate rejects it past `notAfter` even within its local max-age). Both
+are optional but recommended — without `--key-id`, revocation can only target an
+individual attestation (`revokedAttestationKeys`) or fall back to removing the
+public key from `trustedSigners` fleet-wide. See `KEY-MANAGEMENT.md`.
 
 **3. Deliver the public key to each agent host — out of band** (config management,
 a secret store, a provisioned file). It is NOT bundled in the plugin.

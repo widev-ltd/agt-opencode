@@ -484,8 +484,9 @@ export function compileSkillPolicy(raw) {
   // PEM public key OR a FILE PATH to one (the key is delivered out of band — never
   // bundled in the plugin — and the policy points here). Paths are read at load;
   // an unreadable/non-PEM entry is dropped so a typo can't silently weaken trust.
-  // When ANY trusted key is present (or requireSignature is explicitly true), the
-  // gate requires a valid signature from one of them before trusting a CI stamp.
+  // When ANY trusted key is present, requireSignature DEFAULTS to true (strict-when-
+  // signed) so the gate requires a valid signature from one of them before trusting a
+  // CI stamp and never falls back to the forgeable local tier — see requireSignature below.
   const trustedSigners = (Array.isArray(raw.trustedSigners) ? raw.trustedSigners : [])
     .map((s) => String(s ?? ""))
     .map((s) => {
@@ -498,12 +499,35 @@ export function compileSkillPolicy(raw) {
       }
     })
     .filter(Boolean);
-  // STRICT mode (explicit opt-in): when true, an unsigned skill is BLOCKED — no
-  // local-scan fallback. Default false: unsigned skills get a local scan + a
-  // 1-day grace stamp, while CI-signed skills (trustedSigners) get durable trust.
-  const requireSignature = raw.requireSignature === true;
+  // STRICT-WHEN-SIGNED DEFAULT: when the operator configured trusted signers but did
+  // NOT explicitly set requireSignature, default it to TRUE. Rationale: if you set up
+  // CI signing, the gate must NOT silently fall back to the forgeable local tier — an
+  // attacker who can write the data dir could otherwise plant an unsigned local stamp
+  // and be trusted for the 1-day grace. An operator who genuinely wants the local
+  // fallback alongside signing opts back in with an explicit requireSignature:false.
+  // With NO trusted signers, the default stays false (back-compat: pure local tier).
+  const requireSignature =
+    raw.requireSignature === undefined ? trustedSigners.length > 0 : raw.requireSignature === true;
   // Optional override of the unsigned/local-scan grace window (default 1 day).
   const localGraceMs = Number.isFinite(raw.localGraceMs) ? Number(raw.localGraceMs) : undefined;
+  // Optional clock-skew tolerance (ms) for the embedded notBefore/notAfter validity
+  // window in a signed stamp. Passed through to the gate; the attestation default
+  // (DEFAULT_CLOCK_SKEW_MS, 5 min) applies when unset.
+  const clockSkewMs = Number.isFinite(raw.clockSkewMs) ? Number(raw.clockSkewMs) : undefined;
+
+  // REVOCATION (opt-in, fail-safe additive): two independent kill-switches the gate
+  // consults BEFORE trusting a CI stamp. A match makes the stamp NOT-trusted (review/
+  // deny per mode, same path as stale) regardless of an otherwise-valid signature —
+  // so a leaked/retired key or a specific bad attestation can be cut without rotating
+  // every public key. `revokedKeyIds` matches the signed `keyId` field; `revokedAttestationKeys`
+  // matches the record's content-address `key` (the skillIntegrityKey). Entries are
+  // trimmed strings; empties dropped. Never weakens trust — only ever removes it.
+  const revokedKeyIds = (Array.isArray(raw.revokedKeyIds) ? raw.revokedKeyIds : [])
+    .map((s) => String(s ?? "").trim())
+    .filter(Boolean);
+  const revokedAttestationKeys = (Array.isArray(raw.revokedAttestationKeys) ? raw.revokedAttestationKeys : [])
+    .map((s) => String(s ?? "").trim())
+    .filter(Boolean);
 
   return {
     mode,
@@ -512,6 +536,9 @@ export function compileSkillPolicy(raw) {
     trustedSigners,
     requireSignature,
     localGraceMs,
+    clockSkewMs,
+    revokedKeyIds,
+    revokedAttestationKeys,
     allowedSources: Array.isArray(raw.allowedSources)
       ? raw.allowedSources.map((s) => String(s).trim().toLowerCase()).filter(Boolean)
       : [],
@@ -940,7 +967,7 @@ function pushCapabilityFinding(findings, dim, detected, declared, budgetAllows, 
  * skill is allowed with a real scan record instead of a first-run prompt.
  *
  * deps.mjs / attestation.mjs are imported LAZILY so skills.mjs keeps no
- * load-time dependency on them (mirrors deps.attestDepsScan). NEVER throws —
+ * load-time dependency on them. NEVER throws —
  * returns a summary with a `persisted` flag and any `note`/`error`.
  *
  * @param {string} skillDir
@@ -1104,8 +1131,8 @@ export async function auditSkillDir(skillDir, opts = {}) {
 //      → deps.parseManifestFile yields specs WITH versions where present; these can
 //      drive a transitive resolve+scan downstream and contribute CVE coverage.
 //   2. A bare-import JS/TS file with NO manifest → we extract the imported package
-//      NAMES (require()/import) so the Tier-1 metadata checks (typosquat / deny /
-//      allow) still apply. These specs carry NO version, so they CANNOT yield a
+//      NAMES (require()/import) so the Tier-1 metadata checks (operator deny-list /
+//      non-registry source) still apply. These specs carry NO version, so they CANNOT yield a
 //      transitive CVE scan → such a skill stays coverage 'unavailable' and is NOT
 //      stamped safe. (Honest limit: JS has no PEP-723 standard; bare imports give
 //      names, not versions.)
@@ -1136,14 +1163,14 @@ function collectManifestSpecs(deps, skillDir, depsPolicy, summary) {
 
     // Bare-import JS/TS (no manifest): extract imported package NAMES for Tier-1
     // metadata ONLY. We do this whether or not a manifest exists, but the resulting
-    // specs are version-less — they raise typosquat/deny findings yet never let a
-    // skill claim CVE coverage. (Kept best-effort + bounded; never throws.)
+    // specs are version-less — they raise deny-list / non-registry findings yet never
+    // let a skill claim CVE coverage. (Kept best-effort + bounded; never throws.)
     const jsSpecs = collectBareImportSpecs(deps, skillDir, entries, depsPolicy, summary, out);
     if (jsSpecs > 0 && !sawManifest) {
       // Pure bare-import skill (names but no versions): leave a note so the cert's
       // 'unavailable' coverage is explainable rather than silent.
       if (!summary.note) {
-        summary.note = "JS bare imports detected with no manifest/lockfile — package names checked for typosquat/deny, but versions are unknown so CVE coverage is unavailable (skill not stamped safe).";
+        summary.note = "JS bare imports detected with no manifest/lockfile — package names checked against the operator deny-list, but versions are unknown so CVE coverage is unavailable (skill not stamped safe).";
       }
     }
   } catch { /* unreadable dir → declared set stays empty */ }

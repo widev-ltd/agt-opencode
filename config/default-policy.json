@@ -316,6 +316,17 @@
     ],
     "customPatterns": []
   },
+  "intentJudgePolicies": {
+    "enabled": false,
+    "_note": "OPTIONAL LLM-as-judge intention detection — DISABLED by default (it makes a network LLM call per tool call: latency + cost, non-deterministic). When enabled, an LLM assesses the INTENT of a tool call (benign/suspicious/malicious) and feeds it into the decision. ADDITIVE-ONLY: it can raise to review or (enforce) deny, never downgrade a deterministic deny. FAIL-SAFE: a judge error/timeout/missing key degrades to the deterministic decision (set failClosed:true to raise such calls to review instead). The API key is read from the env var named by apiKeyEnv and is NEVER stored here. Defense-in-depth, not a guarantee (non-deterministic, defeatable). To enable: set enabled:true, provider (anthropic|openai|custom), and apiKeyEnv; optionally model, endpoint, mode (advisory|enforce), timeoutMs, failClosed, triggerTools (scope which tools to judge).",
+    "mode": "advisory",
+    "provider": "anthropic",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "model": "claude-haiku-4-5-20251001",
+    "timeoutMs": 4000,
+    "failClosed": false,
+    "triggerTools": []
+  },
   "dlpPolicies": {
     "enabled": true,
     "mode": "advisory",
@@ -406,7 +417,7 @@
   "skillPolicies": {
     "enabled": true,
     "mode": "enforce",
-    "_note": "Skill (Agent Skill) governance: integrity attestation + dangerous-pattern, secret (DLP reuse), prompt-injection, capability-profile, and source-allowlist scans. ENFORCE by default: stop-and-approve an unattested skill once and deny on at/above-threshold findings; set mode to advisory to only warn. Set mode to 'enforce' to stop-and-approve an unattested skill once (a `user-approved` cert is then written so the unchanged skill runs silently) and to deny on at/above-threshold findings. Pre-scan skills with `skills audit` to avoid the first prompt.",
+    "_note": "Skill (Agent Skill) governance: integrity attestation + dangerous-pattern, secret (DLP reuse), prompt-injection, capability-profile, and source-allowlist scans. ENFORCE by default: stop-and-approve an unattested skill once and deny on at/above-threshold findings; set mode to advisory to only warn. Set mode to 'enforce' to stop-and-approve an unattested skill once (a `user-approved` cert is then written so the unchanged skill runs silently) and to deny on at/above-threshold findings. Pre-scan skills with `skills audit` to avoid the first prompt. For unforgeable trust, sign skills in CI (tools/skill-signer) and set skillPolicies.trustedSigners to the public key (PEM or file path, delivered out of band): requireSignature then defaults true (no fallback to the forgeable local tier), and you can revoke a compromised signer via revokedKeyIds or an individual stamp via revokedAttestationKeys. The local unsigned tier is a 1-day (localGraceMs) scan, forgeable but time-boxed.",
     "blockSecrets": true,
     "blockInjection": true,
     "allowedSources": [],

@@ -200,12 +200,31 @@ try {
     const attacker = generateKeyPairSync("ed25519");
     const attackerPriv = attacker.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
+    // signedState: trustedSigners set, requireSignature UNSET → now STRICT-by-default
+    // (the strict-when-signed change). Valid CI signatures still pass under it.
     const signedState = { policy: compilePolicy({
       skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub] },
     }) };
+    // strictState: explicit requireSignature:true (identical effective behavior to
+    // signedState now, kept to document the explicit opt-in).
     const strictState = { policy: compilePolicy({
       skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub], requireSignature: true },
     }) };
+    // localFallbackState: trustedSigners set but requireSignature EXPLICITLY false →
+    // the operator opted back into the forgeable local tier alongside CI signing.
+    // The 1-day-grace local-tier tests run under THIS state (the strict-when-signed
+    // default would otherwise block the unsigned local stamp).
+    const localFallbackState = { policy: compilePolicy({
+      skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub], requireSignature: false },
+    }) };
+
+    // STRICT-WHEN-SIGNED DEFAULT: trustedSigners set + requireSignature unset ⇒ strict.
+    ok("default: trustedSigners set + requireSignature unset ⇒ requireSignature true (strict-when-signed)",
+      compilePolicy({ skillPolicies: { enabled: true, trustedSigners: [ciPub] } }).skill.requireSignature === true);
+    ok("default: no trustedSigners + requireSignature unset ⇒ requireSignature false (back-compat local tier)",
+      compilePolicy({ skillPolicies: { enabled: true } }).skill.requireSignature === false);
+    ok("default: trustedSigners set + explicit requireSignature:false ⇒ false (operator opt-out honored)",
+      compilePolicy({ skillPolicies: { enabled: true, trustedSigners: [ciPub], requireSignature: false } }).skill.requireSignature === false);
 
     const mkSigSkill = (name) => {
       const d = join(base, "skills", name);
@@ -271,22 +290,103 @@ try {
     toCache(g.key, tampered);
     ok("sig T1: strict + tampered CI stamp → review", reviewed(checkSkillDeps(strictState, { command: g.cmd, cwd: base })));
 
-    // T2.1 — DEFAULT (not strict): unsigned CLEAN local stamp → allow (1-day grace; weak, forgeable tier).
+    // T2.0 — STRICT-BY-DEFAULT: the SAME unsigned clean local stamp under signedState
+    // (requireSignature now defaults true) → review, NOT allow (no silent local fallback).
+    const h0 = mkSigSkill("default-strict-local");
+    toCache(h0.key, rec(h0.key, []));
+    ok("sig: strict-by-default blocks an unsigned local stamp (no silent local fallback) → review",
+      reviewed(checkSkillDeps(signedState, { command: h0.cmd, cwd: base })));
+
+    // T2.1 — EXPLICIT opt-out (requireSignature:false): unsigned CLEAN local stamp → allow (1-day grace; weak tier).
     const h = mkSigSkill("local-clean");
     toCache(h.key, rec(h.key, []));
-    ok("sig T2: unsigned clean local stamp → allow (1-day grace, weak tier)", allowed(checkSkillDeps(signedState, { command: h.cmd, cwd: base })));
+    ok("sig T2: explicit requireSignature:false → unsigned clean local stamp → allow (1-day grace, weak tier)",
+      allowed(checkSkillDeps(localFallbackState, { command: h.cmd, cwd: base })));
 
-    // T2.2 — DEFAULT: unsigned local stamp WITH a CVE → deny (local tier still blocks known vulns).
+    // T2.2 — EXPLICIT opt-out: unsigned local stamp WITH a CVE → deny (local tier still blocks known vulns).
     const i = mkSigSkill("local-vuln");
     toCache(i.key, rec(i.key, [{ id: "CVE-Q", severity: "high", package: "q" }]));
-    const ri = checkSkillDeps(signedState, { command: i.cmd, cwd: base });
-    ok("sig T2: unsigned local stamp with a CVE → deny", ri && typeof ri.deny === "string");
+    const ri = checkSkillDeps(localFallbackState, { command: i.cmd, cwd: base });
+    ok("sig T2: explicit requireSignature:false → unsigned local stamp with a CVE → deny", ri && typeof ri.deny === "string");
 
     // BACK-COMPAT — no trustedSigners at all: unsigned clean local stamp → allow.
     const j = mkSigSkill("nokeys");
     toCache(j.key, rec(j.key, []));
     ok("sig: no trustedSigners → unsigned clean local stamp → allow (back-compat)",
       allowed(checkSkillDeps({ policy: compilePolicy({ skillPolicies: { enabled: true, mode: "enforce" } }) }, { command: j.cmd, cwd: base })));
+
+    // ── HARDENING: embedded validity window (notBefore / notAfter) ──
+    // A CI-signed stamp that VERIFIES under a trusted key but whose embedded validity
+    // window has passed (or not yet begun) must be NOT-trusted → review (same path as
+    // stale). The window is in the signed payload, so it is tamper-proof.
+    const nowT = Date.now();
+
+    // VW.1 — notAfter in the PAST → expired → review (otherwise a perfectly clean, signed, fresh stamp).
+    const va = mkSigSkill("vw-expired");
+    toCache(va.key, signAttestationRecord(rec(va.key, []), ciPriv, "ci", { notAfter: nowT - 60 * 1000 }));
+    const vaRes = checkSkillDeps(strictState, { command: va.cmd, cwd: base });
+    ok("VW: signed stamp past its notAfter → review (expired), never allow",
+      reviewed(vaRes) && vaRes.notes.some((n) => /expired|validity window/i.test(n)));
+
+    // VW.2 — notBefore in the FUTURE (beyond skew) → not-yet-valid → review.
+    const vb = mkSigSkill("vw-future");
+    toCache(vb.key, signAttestationRecord(rec(vb.key, []), ciPriv, "ci", { notBefore: nowT + 60 * 60 * 1000 }));
+    const vbRes = checkSkillDeps(strictState, { command: vb.cmd, cwd: base });
+    ok("VW: signed stamp before its notBefore → review (not yet valid), never allow",
+      reviewed(vbRes) && vbRes.notes.some((n) => /not yet valid|notBefore/i.test(n)));
+
+    // VW.3 — a valid window (notBefore in the past, notAfter in the future) → still allows.
+    const vc = mkSigSkill("vw-valid");
+    toCache(vc.key, signAttestationRecord(rec(vc.key, []), ciPriv, "ci",
+      { notBefore: nowT - 60 * 1000, notAfter: nowT + 60 * 60 * 1000 }));
+    ok("VW: signed stamp within its validity window → allow",
+      allowed(checkSkillDeps(strictState, { command: vc.cmd, cwd: base })));
+
+    // VW.4 — notAfter OVERRIDES (tightens) maxAgeMs: a 1h-old stamp is fresh under a
+    // 7-day maxAgeMs, but a notAfter 10 min before now expires it regardless → review.
+    const vd = mkSigSkill("vw-notafter-tighter");
+    toCache(vd.key, signAttestationRecord(
+      { ...rec(vd.key, []), timestampMs: nowT - 3600 * 1000 }, ciPriv, "ci", { notAfter: nowT - 10 * 60 * 1000 }));
+    ok("VW: notAfter tighter than maxAgeMs wins → expired → review (even though age < maxAgeMs)",
+      reviewed(checkSkillDeps(strictState, { command: vd.cmd, cwd: base })));
+
+    // ── HARDENING: revocation (keyId + attestation key kill-switches) ──
+    // VR.1 — revoked keyId → the otherwise-valid signed stamp is NOT-trusted → review.
+    const vrA = mkSigSkill("revoked-keyid");
+    toCache(vrA.key, signAttestationRecord(rec(vrA.key, []), ciPriv, "ci", { keyId: "ci-key-leaked" }));
+    const revokeKeyIdState = { policy: compilePolicy({
+      skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub], revokedKeyIds: ["ci-key-leaked"] },
+    }) };
+    const vrARes = checkSkillDeps(revokeKeyIdState, { command: vrA.cmd, cwd: base });
+    ok("REVOKE: signed stamp with a revoked keyId → review (revoked), never allow",
+      reviewed(vrARes) && vrARes.notes.some((n) => /revoked/i.test(n)) &&
+      vrARes.audit.some((a) => /revoked/.test(a.action)));
+
+    // VR.2 — a NON-revoked keyId under the same revocation list still allows (no over-block).
+    const vrB = mkSigSkill("nonrevoked-keyid");
+    toCache(vrB.key, signAttestationRecord(rec(vrB.key, []), ciPriv, "ci", { keyId: "ci-key-good" }));
+    ok("REVOKE: signed stamp with a non-revoked keyId → allow (revocation is targeted)",
+      allowed(checkSkillDeps(revokeKeyIdState, { command: vrB.cmd, cwd: base })));
+
+    // VR.3 — revoked ATTESTATION KEY (the content-address skillIntegrityKey) → review.
+    const vrC = mkSigSkill("revoked-attkey");
+    toCache(vrC.key, signAttestationRecord(rec(vrC.key, []), ciPriv));
+    const revokeAttKeyState = { policy: compilePolicy({
+      skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub], revokedAttestationKeys: [vrC.key] },
+    }) };
+    const vrCRes = checkSkillDeps(revokeAttKeyState, { command: vrC.cmd, cwd: base });
+    ok("REVOKE: signed stamp whose attestation key is revoked → review (revoked), never allow",
+      reviewed(vrCRes) && vrCRes.notes.some((n) => /revoked/i.test(n)));
+
+    // VR.4 — revocation list present but this stamp matches neither → allow (no collateral).
+    const vrD = mkSigSkill("revoke-nomatch");
+    toCache(vrD.key, signAttestationRecord(rec(vrD.key, []), ciPriv, "ci", { keyId: "ci-key-good" }));
+    const revokeNoMatchState = { policy: compilePolicy({
+      skillPolicies: { enabled: true, mode: "enforce", trustedSigners: [ciPub],
+        revokedKeyIds: ["some-other-key"], revokedAttestationKeys: ["deadbeef"] },
+    }) };
+    ok("REVOKE: a non-matching revocation list does not block a good stamp → allow",
+      allowed(checkSkillDeps(revokeNoMatchState, { command: vrD.cmd, cwd: base })));
   }
 
   // ── Robustness: never throws on a bad cwd / command ──

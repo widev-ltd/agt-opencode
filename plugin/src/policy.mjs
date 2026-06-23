@@ -23,6 +23,7 @@ import { compileDlpPolicy, scanForDlp, dlpDecision } from "./dlp.mjs";
 import { compileRateLimitPolicy, checkRateLimit } from "./rate-limit.mjs";
 import { compileExfilPolicy, trackSecretsFromOutput, checkForExfil } from "./exfil.mjs";
 import { compileContentSafetyPolicy, scanContentSafety } from "./content-safety.mjs";
+import { compileIntentJudgePolicy, evaluateIntent, intentJudgeDecision, intentJudgeApplies } from "./intent-judge.mjs";
 import { compileDepsPolicy, parseManifests, scanDependencyMetadata, depsDecision } from "./deps.mjs";
 import { compileSkillPolicy, checkSkillInvocationMeta, skillFileHashesSync } from "./skills.mjs";
 import * as _skills from "./skills.mjs"; // optional helpers (e.g. skillHasUnhashableEntries) accessed defensively
@@ -36,6 +37,7 @@ import {
   readShippedAttestation,
   DEFAULT_MAX_AGE_MS,
   LOCAL_GRACE_MS,
+  DEFAULT_CLOCK_SKEW_MS,
 } from "./attestation.mjs";
 import { withFileLock, writeFileAtomicSync, dataDir } from "./session-store.mjs";
 
@@ -238,6 +240,7 @@ export function compilePolicy(raw) {
     rateLimit: compileRateLimitPolicy(raw?.rateLimitPolicies ?? null),
     exfil: compileExfilPolicy(raw?.exfilPolicies ?? null),
     contentSafety: compileContentSafetyPolicy(raw?.contentSafetyPolicies ?? null),
+    intentJudge: compileIntentJudgePolicy(raw?.intentJudgePolicies ?? null),
     deps: compileDepsPolicy(raw?.dependencyPolicies ?? null),
     skill: compileSkillPolicy(raw?.skillPolicies ?? null),
   };
@@ -416,6 +419,7 @@ export function mergeMonotonic(base, project) {
   const rateLimit = mergeExtensionMonotonic(base.rateLimit, project.rateLimit, clamp);
   const exfil = mergeExtensionMonotonic(base.exfil, project.exfil, clamp);
   const contentSafety = mergeExtensionMonotonic(base.contentSafety, project.contentSafety, clamp);
+  const intentJudge = mergeExtensionMonotonic(base.intentJudge, project.intentJudge, clamp);
   // Supply-chain layers follow the same monotonic rule: a project may ENABLE or
   // tighten the mode, never disable or relax the body (mergeExtensionMonotonic
   // keeps the base body verbatim — the dlp/exfil-specific relaxation checks
@@ -442,6 +446,7 @@ export function mergeMonotonic(base, project) {
     rateLimit,
     exfil,
     contentSafety,
+    intentJudge,
     deps,
     skill,
   };
@@ -596,6 +601,41 @@ export async function evaluatePreToolUse(state, input, invocation = {}) {
       }
     }
 
+    // Intent judge (OPTIONAL LLM-as-judge; DISABLED by default — no-op unless the
+    // operator configured intentJudgePolicies with a provider+endpoint). Additive-
+    // only and async: it may raise to review or (enforce) hard-deny, NEVER downgrade.
+    // Skipped once the base decision is already deny (no point spending an LLM call,
+    // and it could only weaken a deny — which is forbidden). Fail-safe: a judge that
+    // errors/times out/has no key yields "unavailable" → degrades to the deterministic
+    // decision (or review if failClosed). Never throws into the decision.
+    if (state.policy.intentJudge && decision.effectiveDecision !== "deny"
+        && intentJudgeApplies(state.policy.intentJudge, toolName)) {
+      let verdict = null;
+      try {
+        verdict = await evaluateIntent(
+          { kind: "tool", toolName, command: extractCommandText(input?.toolArgs), args: input?.toolArgs, cwd: input?.cwd },
+          state.policy.intentJudge,
+        );
+      } catch {
+        verdict = null; // a judge failure must never throw into the decision
+      }
+      if (verdict) {
+        const ij = intentJudgeDecision(verdict, state.policy.intentJudge);
+        if (ij.audit) {
+          await recordAudit(state, { action: `tool.${toolName}.intent`, decision: ij.effect === "allow" ? "allow" : ij.effect, sessionId: invocation.sessionId });
+        }
+        if (ij.effect === "deny") {
+          return { permissionDecision: "deny", permissionDecisionReason: ij.reason };
+        }
+        if (ij.effect === "review") {
+          raiseToReview = true;
+          if (ij.reason) notes.push(ij.reason);
+        } else if (ij.note) {
+          notes.push(ij.note); // advisory: surface the verdict as context, no block
+        }
+      }
+    }
+
     const extra = notes.length ? `\n${notes.join("\n")}` : "";
 
     if (decision.effectiveDecision === "deny") {
@@ -657,6 +697,39 @@ function isDepBearingCommand(command) {
   const c = String(command ?? "");
   if (!c.trim()) return false;
   return DEP_COMMAND_RE.test(c.slice(0, 64 * 1024));
+}
+
+// HARDENING checks for a CI stamp that has ALREADY verified under a trusted key, run
+// BEFORE the gate trusts it. Returns { rejected, event, reason }:
+//   - revocation: record.keyId in revokedKeyIds, OR record.key in revokedAttestationKeys.
+//   - validity window (embedded in the SIGNED payload, so tamper-proof): notAfter in
+//     the past → expired; notBefore in the future (beyond clock skew) → not-yet-valid.
+// A rejected stamp is NOT-trusted (the caller treats it like a stale stamp → review/
+// deny per mode, never an allow). FAIL-SAFE: never throws; any structural surprise is
+// caught by the caller's try/catch. ADDITIVE-ONLY: this can only REMOVE trust from a
+// CI stamp, never grant it — a rejection makes the skill less trusted, never more.
+export function evaluateSignedStampHardening(record, key, skillPolicy, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const revokedKeyIds = skillPolicy?.revokedKeyIds ?? [];
+  const revokedKeys = skillPolicy?.revokedAttestationKeys ?? [];
+  // REVOCATION first (cheapest, strongest kill-switch): a revoked key id or a revoked
+  // attestation key cuts the stamp regardless of an otherwise-valid signature/window.
+  if (record && typeof record.keyId === "string" && record.keyId && revokedKeyIds.includes(record.keyId)) {
+    return { rejected: true, event: "revoked", reason: `CI signing key '${record.keyId}' is revoked` };
+  }
+  const recKey = (record && typeof record.key === "string" && record.key) ? record.key : key;
+  if (recKey && revokedKeys.includes(recKey)) {
+    return { rejected: true, event: "revoked", reason: "this attestation has been revoked" };
+  }
+  // VALIDITY WINDOW (signed, so tamper => signature fails before we ever get here).
+  const skew = Number.isFinite(skillPolicy?.clockSkewMs) ? Number(skillPolicy.clockSkewMs) : DEFAULT_CLOCK_SKEW_MS;
+  if (record && typeof record.notAfter === "number" && Number.isFinite(record.notAfter) && now > record.notAfter) {
+    return { rejected: true, event: "expired", reason: "CI signature validity window has expired (notAfter passed)" };
+  }
+  if (record && typeof record.notBefore === "number" && Number.isFinite(record.notBefore) && now < record.notBefore - skew) {
+    return { rejected: true, event: "not-yet-valid", reason: "CI signature is not yet valid (notBefore in the future)" };
+  }
+  return { rejected: false, event: null, reason: null };
 }
 
 export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}) {
@@ -729,6 +802,7 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
         const dbVersion = readCachedScannerDbVersion();
         const ciMaxAge = skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
         const localMaxAge = skillPolicy.localGraceMs ?? LOCAL_GRACE_MS;
+        const now = Date.now();
 
         // TIER 1 (strong, durable): a CI-signed stamp — shipped alongside the skill
         // or in the local cache — that VERIFIES under a trusted key, is BOUND to
@@ -738,25 +812,49 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
         // the agent's box, so a local attacker cannot forge this tier.
         const shipped = readShippedAttestation(meta.skillDir);
         const cacheRec = readAttestation(key);
-        const ciStamp = [shipped, cacheRec].find(
+        let ciStamp = [shipped, cacheRec].find(
           (r) => r && r.key === key && verifyAttestationSignature(r, trusted),
         );
-        const ciFresh = ciStamp && isFresh(ciStamp, { maxAgeMs: ciMaxAge, currentDbVersion: dbVersion, nowMs: Date.now() });
+        // HARDENING (additive, fail-safe): BEFORE trusting a verified CI stamp, run
+        // the revocation kill-switch + the embedded validity window. Either makes the
+        // stamp NOT-trusted — we drop it (treat as if no valid CI stamp existed) and
+        // surface WHY, so a revoked/expired/not-yet-valid stamp is never silently
+        // honored and never silently dropped. Falls through to strict/local/no-record.
+        let ciRejectReason = null; // a specific reason that supersedes the generic strict note
+        if (ciStamp) {
+          const hard = evaluateSignedStampHardening(ciStamp, key, skillPolicy, now);
+          if (hard.rejected) {
+            audit.push({ action: `tool.skill-attest-${hard.event}`, decision: enforce ? "review" : "allow" });
+            ciRejectReason = hard.reason;
+            ciStamp = undefined; // a rejected CI stamp is NOT a valid CI pass
+          }
+        }
+        // The embedded notAfter tightens the durable window: a signed notAfter that
+        // is sooner than timestampMs+maxAgeMs makes the stamp expire on time (the
+        // tighter of the two wins). isFresh handles the maxAgeMs side; the notAfter
+        // side is enforced by evaluateSignedStampHardening above.
+        const ciFresh = ciStamp && isFresh(ciStamp, { maxAgeMs: ciMaxAge, currentDbVersion: dbVersion, nowMs: now });
 
         if (ciFresh) {
           audit.push({ action: "tool.skill-attest-ci", decision: "allow" });
           // CI-signed pass → allow (silent).
         } else if (skillPolicy.requireSignature === true) {
-          // STRICT mode: no fresh CI pass and NO local fallback → block/review.
+          // STRICT mode: no fresh CI pass and NO local fallback → block/review. When a
+          // CI stamp was present but rejected by hardening, the specific reason
+          // (revoked / expired / not-yet-valid / tampered) supersedes the generic note.
           audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
-          if (enforce) { raiseToReview = true; notes.push("AGT skill gate: no valid CI signature (signature required) — review."); }
-          else notes.push("AGT skill gate advisory: no valid CI signature (signature-required mode).");
+          const why = ciRejectReason ?? "no valid CI signature (signature required)";
+          if (enforce) { raiseToReview = true; notes.push(`AGT skill gate: ${why} — review.`); }
+          else notes.push(`AGT skill gate advisory: ${ciRejectReason ?? "no valid CI signature (signature-required mode)"}.`);
         } else if (cacheRec) {
           // TIER 2 (weak, 1-day grace): an unsigned, locally-scanned stamp. Findings
           // drive the decision (clean→allow, vuln→deny); trust expires after the
           // 1-day window (DB bump / post-disclosure CVE re-triggers a scan). This
           // tier is forgeable by a local writer — the 1-day expiry caps the exposure.
-          const fresh = isFresh(cacheRec, { maxAgeMs: localMaxAge, currentDbVersion: dbVersion, nowMs: Date.now() });
+          // If a CI stamp was just rejected (revoked/expired), surface that here too so
+          // the demotion to the weaker local tier is never silent — additive note only.
+          if (ciRejectReason) notes.push(`AGT skill gate advisory: ${ciRejectReason} — falling back to the local (unsigned) tier.`);
+          const fresh = isFresh(cacheRec, { maxAgeMs: localMaxAge, currentDbVersion: dbVersion, nowMs: now });
           const effect = decideFromFindings(cacheRec, {
             mode: skillPolicy.mode,
             severityThreshold: skillPolicy.severityThreshold ?? "high",
@@ -777,15 +875,19 @@ export function checkSkillDeps(state, { command = "", cwd = "", sessionId } = {}
             else notes.push("AGT skill gate advisory: local scan is stale (>1 day) — re-scan recommended.");
           }
         } else {
-          // No CI signature and no local stamp — a local scan could not establish
-          // trust (ensureSkillScanned runs first; absence here means it could not
-          // scan, e.g. no resolver/scanner installed). Fail safe → review/note.
+          // No (valid) CI signature and no local stamp — a local scan could not
+          // establish trust (ensureSkillScanned runs first; absence here means it
+          // could not scan, e.g. no resolver/scanner installed), OR the only CI stamp
+          // was rejected by hardening. Fail safe → review/note.
           audit.push({ action: "tool.skill-attest", decision: enforce ? "review" : "allow" });
+          const why = ciRejectReason
+            ? `${ciRejectReason} and no local scan available`
+            : "skill not attested and no local scan available";
           if (enforce) {
             raiseToReview = true;
-            notes.push("AGT skill gate: skill not attested and no local scan available — review (install uv/npm + a scanner, or ship a CI-signed attestation).");
+            notes.push(`AGT skill gate: ${why} — review (install uv/npm + a scanner, or ship a CI-signed attestation).`);
           } else {
-            notes.push("AGT skill gate advisory: skill not yet attested (run `skills audit`, ship a CI signature, or install a scanner).");
+            notes.push(`AGT skill gate advisory: ${ciRejectReason ? `${ciRejectReason}; ` : ""}skill not yet attested (run \`skills audit\`, ship a CI signature, or install a scanner).`);
           }
         }
       }
@@ -826,7 +928,11 @@ export async function ensureSkillScanned(state, { command = "", cwd = "" } = {})
     const now = Date.now();
     const ciStamp = [readShippedAttestation(meta.skillDir), readAttestation(key)]
       .find((r) => r && r.key === key && verifyAttestationSignature(r, trusted));
-    if (ciStamp && isFresh(ciStamp, { maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS, currentDbVersion: dbVersion, nowMs: now })) {
+    // A revoked/expired/not-yet-valid CI stamp does NOT count as covering the skill —
+    // mirror the gate's hardening so we still run a local scan to give the fallback
+    // tier a stamp instead of short-circuiting on a stamp the gate will reject.
+    const ciOk = ciStamp && !evaluateSignedStampHardening(ciStamp, key, skillPolicy, now).rejected;
+    if (ciOk && isFresh(ciStamp, { maxAgeMs: skillPolicy.maxAgeMs ?? DEFAULT_MAX_AGE_MS, currentDbVersion: dbVersion, nowMs: now })) {
       return; // a fresh CI signature already covers it
     }
     const cacheRec = readAttestation(key);

@@ -39,9 +39,15 @@ policy decision is `review`, there is no prompt to approve it, so the gate fails
 - The default **`balanced`** profile is chosen precisely so the agent can still
   do core work (read + write/edit are *allowed*, not reviewed). Only
   `bash`/`webfetch`/`websearch`/`task` are reviewed → currently denied.
-- If you need the agent to run shell/web freely, either widen `allowedTools` in
-  your policy (you accept the risk) or switch to the **`advisory`** profile,
-  which never blocks and only surfaces findings.
+- If you need the agent to run shell/web freely, the recommended fix is the
+  **`secure-low-friction`** profile: it **keeps the threat rules** (`rm -rf`,
+  secret reads, metadata SSRF, exfil/DLP/content-safety all still enforce) but
+  drops the blanket review tier, so `bash`/`webfetch`/`websearch` are *allowed*
+  rather than reviewed-then-denied. Only `task` (subagent spawning) stays
+  reviewed.
+- The blunter alternatives are to widen `allowedTools` by hand (you accept the
+  risk) or switch to the **`advisory`** profile, which never blocks and only
+  surfaces findings.
 
 See [CONFIGURATION.md](CONFIGURATION.md) to change this.
 
